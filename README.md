@@ -74,9 +74,17 @@ INVALIDATE_TOKEN_ON_SHUTDOWN=false
 
 ### 3. Get TextRP Access Token
 
-1. Go to your TextRP dashboard
-2. Generate or copy your bot's access token
-3. Add it to your `.env` file:
+1. Click on your profile icon in the TextRP app
+2. Select **All settings**
+
+![Steps 1-2: Open settings](images/1-2.png)
+
+3. Click **Help & About** in the left sidebar
+4. Click **Access Token** to reveal and copy your token
+
+![Steps 3-4: Get access token](images/3-4.png)
+
+5. Add it to your `.env` file:
    ```env
    TEXTRP_ACCESS_TOKEN=your_actual_access_token_here
    ```
