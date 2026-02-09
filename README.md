@@ -1,13 +1,13 @@
 # TextRP Chatbot Template
 
-A comprehensive Python chatbot template for [TextRP](https://textrp.io/). Features XRPL (XRP Ledger) wallet balance queries and weather information retrieval.
+A comprehensive Python chatbot template for [TextRP](https://textrp.io/). Features XRPL (XRP Ledger) wallet balance queries and faucet functionality.
 
 ## Features
 
 - **Full TextRP Support** - Complete implementation of TextRP room operations
 - **XRP Wallet Integration** - TextRP user IDs are XRP wallet addresses
 - **XRPL Wallet Queries** - Check XRP balances, account info, trust lines, NFTs, and more
-- **Weather Information** - Fetch weather by city name or ZIP code via OpenWeatherMap API
+- **Faucet Commands** - Claim tokens and troubleshoot trustlines
 - **Extensible Command System** - Easy-to-use decorators for adding custom commands
 - **Production Ready** - Graceful shutdown, signal handling, and comprehensive logging
 
@@ -18,7 +18,7 @@ textrp-chatbot/
 ├── main.py              # Main entry point with bot application
 ├── textrp_chatbot.py    # TextRP protocol client with all room methods
 ├── xrpl_utils.py        # XRPL client for wallet queries
-├── weather_utils.py     # Weather API client
+├── faucet_db.py         # Faucet claim tracking database
 ├── config.yaml          # Configuration template
 ├── .env.example         # Environment variables template
 ├── requirements.txt     # Python dependencies
@@ -62,8 +62,15 @@ XRPL_NETWORK=mainnet
 # XRPL_RPC_URL is optional - uses default network endpoints if not set
 # XRPL_RPC_URL=https://your-custom-rpc-endpoint.com
 
-# Weather API (get free key at https://openweathermap.org/api)
-WEATHER_API_KEY=your_openweathermap_api_key
+# Faucet configuration
+FAUCET_WALLET_SEED=your_faucet_wallet_seed
+FAUCET_CURRENCY_CODE=TXT
+FAUCET_DAILY_AMOUNT=100
+FAUCET_COOLDOWN_HOURS=24
+FAUCET_MIN_XRP_BALANCE=0.1
+TOKEN_ISSUER=your_token_issuer_address
+FAUCET_COLD_WALLET=your_token_issuer_address
+FAUCET_DB_PATH=faucet.db
 
 # Bot Settings
 BOT_COMMAND_PREFIX=!
@@ -108,9 +115,11 @@ The bot will:
 | `!ping` | Check if bot is online | `!ping` |
 | `!whoami` | Show your TextRP ID and wallet | `!whoami` |
 | `!balance [address]` | Check XRP wallet balance | `!balance rN7n3...` |
-| `!wallet [address]` | Get detailed wallet info | `!wallet rN7n3...` |
-| `!weather <location>` | Get current weather | `!weather New York` |
-| `!forecast <location>` | Get weather forecast | `!forecast 90210` |
+| `!tokens [address]` | Show token balances | `!tokens rN7n3...` |
+| `!faucet` | Claim daily tokens from the faucet | `!faucet` |
+| `!trust` | Check if you have the required trust line | `!trust` |
+| `!trustdebug` | Show detailed trustline debugging info | `!trustdebug` |
+| `!lp` | Show LP NFT status (if configured) | `!lp` |
 
 ## TextRP Token Authentication
 
@@ -242,30 +251,6 @@ fee = await xrpl.get_current_fee()
 summary = await xrpl.get_wallet_summary("rWalletAddress...")
 ```
 
-## Weather Integration
-
-The `WeatherClient` supports queries by city name or ZIP code:
-
-```python
-from weather_utils import WeatherClient, TemperatureUnit
-
-weather = WeatherClient(
-    api_key="your_api_key",
-    units=TemperatureUnit.FAHRENHEIT  # or CELSIUS
-)
-
-# Current weather
-data = await weather.get_weather_by_city("New York", "US")
-data = await weather.get_weather_by_zip("10001", "US")
-data = await weather.get_weather("New York")  # Auto-detects type
-
-# Forecast
-forecast = await weather.get_forecast("London", "GB", days=5)
-
-# Formatted output for chat
-message = weather.format_weather_message(data)
-forecast_msg = weather.format_forecast_message(forecast)
-```
 
 ## Adding Custom Commands
 
@@ -324,18 +309,6 @@ wallet = bot.textrp.get_user_wallet_address(user_id)
 # Returns: "rN7n3473SaZBCG4dFL83w7a1RXtXtbk2D9"
 ```
 
-## API Keys
-
-### OpenWeatherMap (Weather)
-
-1. Sign up at [OpenWeatherMap](https://openweathermap.org/api)
-2. Get your free API key from the dashboard
-3. Set `WEATHER_API_KEY` in your `.env` file
-
-### TextRP Account
-
-Create a bot account on TextRP.
-
 ## Configuration Options
 
 ### Environment Variables
@@ -350,7 +323,6 @@ Create a bot account on TextRP.
 | `INVALIDATE_TOKEN_ON_SHUTDOWN` | Whether to invalidate token on shutdown (true/false) | `false` |
 | `XRPL_NETWORK` | XRPL network to use (mainnet/testnet/devnet) | `mainnet` |
 | `XRPL_RPC_URL` | Custom XRPL RPC endpoint (optional) | Uses default endpoints |
-| `WEATHER_API_KEY` | OpenWeatherMap API key for weather commands | Optional |
 | `BOT_COMMAND_PREFIX` | Prefix for bot commands | `!` |
 | `BOT_LOG_LEVEL` | Logging level (DEBUG/INFO/WARNING/ERROR) | `INFO` |
 
@@ -371,8 +343,6 @@ The `INVALIDATE_TOKEN_ON_SHUTDOWN` flag controls whether the bot's access token 
 # Test XRPL client
 python xrpl_utils.py
 
-# Test weather client
-python weather_utils.py
 ```
 
 ### Logging

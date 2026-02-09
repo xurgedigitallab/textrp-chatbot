@@ -3,10 +3,10 @@
 TextRP Chatbot - Main Entry Point
 ===================================
 A feature-rich TextRP chatbot with XRPL wallet integration
-and weather query capabilities.
+and faucet functionality.
 
 This is the main entry point that:
-- Initializes all components (TextRP client, XRPL client, Weather client)
+- Initializes all components (TextRP client, XRPL client)
 - Registers command handlers for bot commands
 - Starts the TextRP sync loop with graceful shutdown
 
@@ -21,7 +21,6 @@ Environment Variables:
     TEXTRP_USERNAME    - Bot's TextRP user ID
     TEXTRP_ACCESS_TOKEN - Bot's access token
     TEXTRP_ROOM_ID     - Optional default room to join
-    WEATHER_API_KEY    - OpenWeatherMap API key
     XRPL_NETWORK       - XRPL network (mainnet/testnet/devnet)
 """
 
@@ -40,7 +39,6 @@ from xrpl_utils import XRPLClient
 from xrpl.wallet import Wallet
 from xrpl.models.requests import AccountLines
 from faucet_db import FaucetDB
-from weather_utils import WeatherClient, TemperatureUnit
 
 # Import Matrix event types for handlers
 from nio import RoomMessageText, RoomMemberEvent, InviteMemberEvent
@@ -93,9 +91,6 @@ class BotConfig:
         self.xrpl_network = os.getenv("XRPL_NETWORK", "mainnet")
         self.xrpl_rpc_url = os.getenv("XRPL_RPC_URL")
         
-        # Weather configuration
-        self.weather_api_key = os.getenv("WEATHER_API_KEY", "")
-        
         # Faucet configuration
         self.faucet_wallet_seed = os.getenv("FAUCET_WALLET_SEED", "")
         self.faucet_currency_code = os.getenv("FAUCET_CURRENCY_CODE", "TXT")
@@ -130,12 +125,6 @@ class BotConfig:
                 "Set TEXTRP_USERNAME environment variable."
             )
         
-        if not self.weather_api_key:
-            logger.warning(
-                "WEATHER_API_KEY not set. Weather commands will not work. "
-                "Get a free key at https://openweathermap.org/api"
-            )
-        
         return True
 
 
@@ -147,14 +136,13 @@ class TextRPBot:
     """
     Main bot application class.
     
-    Integrates TextRP chatbot with XRPL and weather services.
+    Integrates TextRP chatbot with XRPL services.
     Handles command routing and graceful shutdown.
     
     Attributes:
         config (BotConfig): Bot configuration
         textrp (TextRPChatbot): TextRP client
         xrpl (XRPLClient): XRPL client for wallet queries
-        weather (WeatherClient): Weather API client
     """
     
     def __init__(self, config: BotConfig):
@@ -183,12 +171,6 @@ class TextRPBot:
         self.xrpl = XRPLClient(
             network=config.xrpl_network,
             rpc_url=config.xrpl_rpc_url,
-        )
-        
-        # Initialize Weather client
-        self.weather = WeatherClient(
-            api_key=config.weather_api_key,
-            units=TemperatureUnit.FAHRENHEIT,
         )
         
         # Initialize faucet database

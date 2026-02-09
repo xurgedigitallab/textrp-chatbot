@@ -59,54 +59,6 @@ def mock_xrpl_response_not_found():
     return response
 
 
-@pytest.fixture
-def mock_weather_data():
-    """Sample weather API response data."""
-    return {
-        "coord": {"lon": -74.006, "lat": 40.7143},
-        "weather": [
-            {"id": 800, "main": "Clear", "description": "clear sky", "icon": "01d"}
-        ],
-        "main": {
-            "temp": 72.5,
-            "feels_like": 70.2,
-            "temp_min": 68.0,
-            "temp_max": 76.0,
-            "humidity": 45,
-            "pressure": 1015,
-        },
-        "visibility": 16093,
-        "wind": {"speed": 5.5, "deg": 180, "gust": 8.0},
-        "clouds": {"all": 10},
-        "dt": 1699900000,
-        "sys": {
-            "country": "US",
-            "sunrise": 1699870000,
-            "sunset": 1699908000,
-        },
-        "timezone": -18000,
-        "name": "New York",
-    }
-
-
-@pytest.fixture
-def mock_aiohttp_session():
-    """Create a mock aiohttp ClientSession."""
-    session = MagicMock()
-    session.__aenter__ = AsyncMock(return_value=session)
-    session.__aexit__ = AsyncMock(return_value=None)
-    return session
-
-
-@pytest.fixture
-def mock_aiohttp_response(mock_weather_data):
-    """Create a mock aiohttp response."""
-    response = MagicMock()
-    response.status = 200
-    response.json = AsyncMock(return_value=mock_weather_data)
-    return response
-
-
 # =============================================================================
 # SAMPLE DATA FIXTURES
 # =============================================================================
