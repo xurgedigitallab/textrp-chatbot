@@ -29,6 +29,7 @@ import logging
 import os
 import signal
 import sys
+from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -44,7 +45,7 @@ from faucet_db import FaucetDB
 from nio import RoomMessageText, RoomMemberEvent, InviteMemberEvent
 
 # Load environment variables from .env file
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
 
 # =============================================================================
 # LOGGING CONFIGURATION
@@ -92,13 +93,19 @@ class BotConfig:
         self.xrpl_rpc_url = os.getenv("XRPL_RPC_URL")
         
         # Faucet configuration
-        self.faucet_wallet_seed = os.getenv("FAUCET_WALLET_SEED", "")
+        self.faucet_wallet_seed = os.getenv("FAUCET_WALLET_SEED", "") or os.getenv("FAUCET_HOT_WALLET_SEED", "")
         self.faucet_currency_code = os.getenv("FAUCET_CURRENCY_CODE", "TXT")
         self.faucet_daily_amount = os.getenv("FAUCET_DAILY_AMOUNT", "100")
-        self.faucet_cooldown_hours = int(os.getenv("FAUCET_COOLDOWN_HOURS", "24"))
+        self.faucet_cooldown_hours = int(
+            os.getenv("FAUCET_COOLDOWN_HOURS", "") or os.getenv("FAUCET_CLAIM_COOLDOWN_HOURS", "24")
+        )
         self.faucet_min_xrp_balance = float(os.getenv("FAUCET_MIN_XRP_BALANCE", "0.1"))
-        self.token_issuer = os.getenv("TOKEN_ISSUER", "")
         self.faucet_cold_wallet = os.getenv("FAUCET_COLD_WALLET", "")
+        self.token_issuer = (
+            os.getenv("TOKEN_ISSUER", "")
+            or os.getenv("FAUCET_TOKEN_ISSUER", "")
+            or self.faucet_cold_wallet
+        )
         self.faucet_admin_users = os.getenv("FAUCET_ADMIN_USERS", "").split(",") if os.getenv("FAUCET_ADMIN_USERS") else []
         self.faucet_db_path = os.getenv("FAUCET_DB_PATH", "faucet.db")
         
@@ -615,7 +622,7 @@ class TextRPBot:
                 trust_line = await self.xrpl.check_trust_line(
                     user_wallet,
                     self.config.faucet_currency_code,
-                    self.config.faucet_cold_wallet
+                    self.config.token_issuer
                 )
                 
                 if not trust_line:
