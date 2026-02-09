@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  textrp-chatbot:
+    build: .
+    container_name: textrp-chatbot-e2ee
+    volumes:
+      - .:/app
+      - /app/__pycache__  # Prevent Python cache from being mounted
+    environment:
+      - PYTHONUNBUFFERED=1
+      - ENVIRONMENT=docker
+    # If you need to expose ports, uncomment below:
+    # ports:
+    #   - "8080:8080"
+    # For interactive sessions:
+    stdin_open: true
+    tty: true
+    
+  # Optional: A one-time setup service to verify E2EE installation
+  verify-e2ee:
+    build: .
+    container_name: verify-e2ee
+    command: >
+      python -c "
+        import olm;
+        print(f'python-olm version: {olm.__version__}');
+        print('E2EE is ready!')
+      "
+    volumes:
+      - .:/app
+    profiles:
+      - verify

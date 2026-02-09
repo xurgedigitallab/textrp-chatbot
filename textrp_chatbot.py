@@ -103,7 +103,16 @@ from nio import (
     RoomHistoryVisibilityEvent,
     RoomJoinRulesEvent,
     RoomEncryptionEvent,
+    MegolmEvent,
+    OlmEvent,
+    RoomEncrypted,
     Event,
+    
+    # Encryption classes
+    EncryptionError,
+    DeviceTrust,
+    OlmDevice,
+    TrustState,
 )
 
 from dotenv import load_dotenv
@@ -180,7 +189,7 @@ class TextRPChatbot:
                 max_limit_exceeded=0,
                 max_timeouts=0,
                 store_sync_tokens=True,
-                encryption_enabled=False,
+                encryption_enabled=True,  # Enable E2EE
             )
         else:
             client_config = config
@@ -463,7 +472,7 @@ class TextRPChatbot:
             is_direct: True for direct message rooms (1:1 chats)
             invite: List of user IDs to invite (XRP wallet addresses on TextRP)
             preset: Room preset - "private_chat", "public_chat", or "trusted_private_chat"
-            room_alias: Local part of room alias (e.g., "my-room" -> #my-room:server)
+            room_alias: Room alias (e.g., "my-room" -> #my-room:server)
             visibility: "public" (listed in directory) or "private" (unlisted)
             initial_state: List of state events to set on room creation
             power_level_override: Custom power levels for the room
@@ -486,7 +495,7 @@ class TextRPChatbot:
             is_direct=is_direct,
             invite=invite or [],
             preset=preset,
-            room_alias_name=room_alias,
+            room_alias=room_alias,
             visibility=visibility,
             initial_state=initial_state or [],
             power_level_override=power_level_override,
@@ -1592,6 +1601,131 @@ class TextRPChatbot:
         return response.event_id
     
     # =========================================================================
+    # ENCRYPTION METHODS
+    # =========================================================================
+    
+    async def enable_room_encryption(self, room_id: str) -> bool:
+        """
+        Enable end-to-end encryption for a room.
+        
+        Args:
+            room_id: The ID of the room to enable encryption for
+            
+        Returns:
+            bool: True if encryption was enabled successfully
+        """
+        logger.info(f"Enabling encryption for room {room_id}")
+        
+        # Send the encryption state event
+        encryption_content = {
+            "algorithm": "m.megolm.v1.aes-sha2"
+        }
+        
+        response = await self.client.room_put_state(
+            room_id=room_id,
+            event_type="m.room.encryption",
+            content=encryption_content
+        )
+        
+        if isinstance(response, RoomPutStateError):
+            logger.error(f"Failed to enable encryption: {response.message}")
+            return False
+        
+        logger.info(f"Encryption enabled for room {room_id}")
+        return True
+    
+    async def send_encrypted_message(self, room_id: str, message: str) -> Optional[str]:
+        """
+        Send an encrypted message to a room.
+        
+        Args:
+            room_id: The ID of the room
+            message: The message to send
+            
+        Returns:
+            The event ID of the sent message, or None if failed
+        """
+        logger.info(f"Sending encrypted message to {room_id}")
+        
+        try:
+            # Check if the room is encrypted
+            room = self.client.rooms.get(room_id)
+            if not room or not room.encrypted:
+                logger.warning(f"Room {room_id} is not encrypted, sending as plain text")
+                return await self.send_message(room_id, message)
+            
+            # Send encrypted message
+            response = await self.client.room_send(
+                room_id=room_id,
+                message_type="m.room.encrypted",
+                content={
+                    "msgtype": "m.text",
+                    "body": message
+                }
+            )
+            
+            if isinstance(response, RoomSendError):
+                logger.error(f"Failed to send encrypted message: {response.message}")
+                return None
+            
+            logger.info(f"Encrypted message sent successfully")
+            return response.event_id
+            
+        except Exception as e:
+            logger.error(f"Error sending encrypted message: {e}")
+            return None
+    
+    async def trust_device(self, user_id: str, device_id: str) -> bool:
+        """
+        Mark a device as trusted.
+        
+        Args:
+            user_id: The user ID of the device owner
+            device_id: The device ID to trust
+            
+        Returns:
+            bool: True if device was marked as trusted
+        """
+        try:
+            device = self.client.device_store[user_id].get(device_id)
+            if device:
+                device.trust = TrustState.verified
+                logger.info(f"Device {device_id} for user {user_id} is now trusted")
+                return True
+            else:
+                logger.error(f"Device {device_id} not found for user {user_id}")
+                return False
+        except Exception as e:
+            logger.error(f"Error trusting device: {e}")
+            return False
+    
+    async def verify_user_devices(self, user_id: str) -> None:
+        """
+        Verify and optionally trust all devices for a user.
+        
+        Args:
+            user_id: The user ID whose devices to verify
+        """
+        try:
+            devices = self.client.device_store.get(user_id, {})
+            if not devices:
+                logger.info(f"No devices found for user {user_id}")
+                return
+            
+            logger.info(f"Found {len(devices)} device(s) for user {user_id}")
+            
+            for device_id, device in devices.items():
+                logger.info(f"Device {device_id}: {device.display_name or 'Unknown'}")
+                
+                # Auto-trust devices for convenience (in production, you might want verification)
+                if device.trust == TrustState.unset:
+                    logger.info(f"Auto-trusting device {device_id}")
+                    await self.trust_device(user_id, device_id)
+                    
+        except Exception as e:
+            logger.error(f"Error verifying devices for {user_id}: {e}")
+    
+    # =========================================================================
     # EVENT HANDLING
     # =========================================================================
     
@@ -1640,6 +1774,11 @@ class TextRPChatbot:
         
         Internal method called for each event during sync.
         """
+        # Handle encrypted messages
+        if isinstance(event, (MegolmEvent, OlmEvent, RoomEncrypted)):
+            await self._handle_encrypted_event(room, event)
+            return
+        
         # Get handlers for this event type
         handlers = self._event_handlers.get(type(event), [])
         
@@ -1652,6 +1791,57 @@ class TextRPChatbot:
         # Check for commands in text messages
         if isinstance(event, RoomMessageText):
             await self._process_command(room, event)
+    
+    async def _handle_encrypted_event(self, room, event) -> None:
+        """
+        Handle an encrypted event.
+        
+        Args:
+            room: The room object
+            event: The encrypted event
+        """
+        try:
+            # Try to decrypt the event
+            if isinstance(event, MegolmEvent):
+                # Group message
+                decrypted = self.client.decrypt_event(event)
+                if decrypted:
+                    logger.info(f"Decrypted Megolm message from {event.sender}")
+                    
+                    # Create a temporary event-like object for handlers
+                    class DecryptedEvent:
+                        def __init__(self, decrypted_event, original_event):
+                            self.sender = original_event.sender
+                            self.room_id = original_event.room_id
+                            self.event_id = original_event.event_id
+                            self.timestamp = original_event.server_timestamp
+                            self.body = decrypted_event.body
+                            self.formatted_body = getattr(decrypted_event, 'formatted_body', None)
+                            self.msgtype = getattr(decrypted_event, 'msgtype', 'm.text')
+                            self.decrypted = True
+                    
+                    decrypted_event = DecryptedEvent(decrypted, event)
+                    
+                    # Process like a regular message
+                    handlers = self._event_handlers.get(RoomMessageText, [])
+                    for handler in handlers:
+                        try:
+                            await handler(room, decrypted_event)
+                        except Exception as e:
+                            logger.error(f"Error in encrypted message handler: {e}")
+                    
+                    # Check for commands
+                    await self._process_command(room, decrypted_event)
+                else:
+                    logger.warning(f"Failed to decrypt message from {event.sender}")
+                    
+            elif isinstance(event, OlmEvent):
+                # Direct message (device-to-device)
+                logger.info(f"Received Olm event from {event.sender}")
+                # These are typically key exchange messages, handled automatically by matrix-nio
+                
+        except Exception as e:
+            logger.error(f"Error handling encrypted event: {e}")
     
     async def _process_command(self, room, event) -> None:
         """

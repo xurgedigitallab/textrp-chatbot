@@ -17,7 +17,7 @@ Usage:
 
 import asyncio
 import logging
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List, Union, Tuple
 from decimal import Decimal
 from datetime import datetime
 
@@ -38,6 +38,11 @@ from xrpl.models.requests import (
 from xrpl.models.response import Response
 from xrpl.utils import drops_to_xrp, xrp_to_drops
 from xrpl.core.addresscodec import is_valid_classic_address
+from xrpl.models.transactions import Payment, TrustSet
+from xrpl.wallet import Wallet
+from xrpl.core.keypairs import derive_keypair
+from xrpl.asyncio.clients import AsyncWebsocketClient
+from xrpl.models.requests import *
 
 # Import retry utilities
 try:
@@ -57,31 +62,8 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# XRPL NETWORK ENDPOINTS
+# CONSTANTS
 # =============================================================================
-
-# Official XRPL network endpoints
-XRPL_NETWORKS = {
-    # Mainnet - Production network with real XRP
-    "mainnet": [
-        "https://xrplcluster.com",           # Community-run cluster (HTTP)
-        "https://s1.ripple.com:51234/",      # Ripple's public server
-        "https://s2.ripple.com:51234/",      # Ripple's backup server
-        "https://xrpl.link",                 # Alternative public endpoint
-        "https://ripple.com:51234/",          # Official Ripple endpoint
-    ],
-    
-    # Testnet - For testing with free test XRP
-    "testnet": [
-        "https://s.altnet.rippletest.net:51234",
-        "https://testnet.xrpl-labs.com",
-    ],
-    
-    # Devnet - For development with free dev XRP
-    "devnet": [
-        "https://s.devnet.rippletest.net:51234",
-    ],
-}
 
 # XRP decimal places (1 XRP = 1,000,000 drops)
 XRP_DECIMAL_PLACES = 6
@@ -89,26 +71,23 @@ XRP_DECIMAL_PLACES = 6
 
 class XRPLClient:
     """
-    Asynchronous XRPL client for querying the XRP Ledger.
+    Async client for interacting with the XRP Ledger.
     
-    This class provides methods to query account information, balances,
-    trust lines, transactions, and other XRPL data.
+    Handles connection management, retries, and common XRPL operations.
     
     Attributes:
         network (str): The network to connect to (mainnet/testnet/devnet)
         rpc_url (str): The JSON-RPC endpoint URL
         client (AsyncJsonRpcClient): The underlying xrpl-py client
-        
-    Example:
-        >>> xrpl = XRPLClient(network="mainnet")
-        >>> balance = await xrpl.get_account_balance("rN7n3473SaZBCG4dFL83w7a1RXtXtbk2D9")
-        >>> print(f"Balance: {balance} XRP")
     """
     
     def __init__(
         self,
         network: str = "mainnet",
-        rpc_url: Optional[str] = None
+        rpc_url: Optional[str] = None,
+        mainnet_url: str = "https://xrplcluster.com",
+        testnet_url: str = "https://s.altnet.rippletest.net:51234",
+        devnet_url: str = "https://s.devnet.rippletest.net:51234"
     ):
         """
         Initialize the XRPL client.
@@ -116,15 +95,24 @@ class XRPLClient:
         Args:
             network: Network to connect to - "mainnet", "testnet", or "devnet"
             rpc_url: Optional custom RPC URL (overrides network selection)
+            mainnet_url: Mainnet RPC endpoint URL
+            testnet_url: Testnet RPC endpoint URL
+            devnet_url: Devnet RPC endpoint URL
         """
         self.network = network.lower()
         
-        # Use custom URL or first URL from network list
+        # Map networks to their URLs
+        network_urls = {
+            "mainnet": mainnet_url,
+            "testnet": testnet_url,
+            "devnet": devnet_url,
+        }
+        
+        # Use custom URL or network-specific URL
         if rpc_url:
             self.rpc_url = rpc_url
         else:
-            network_urls = XRPL_NETWORKS.get(self.network, XRPL_NETWORKS["mainnet"])
-            self.rpc_url = network_urls[0]
+            self.rpc_url = network_urls.get(self.network, mainnet_url)
         
         # Initialize the async client
         self.client = AsyncJsonRpcClient(self.rpc_url)
@@ -212,51 +200,44 @@ class XRPLClient:
     
     async def test_connectivity(self) -> Dict[str, Any]:
         """
-        Test connectivity to all available XRPL nodes.
+        Test connectivity to the current XRPL node.
         
         Returns:
-            Dict: Connectivity test results for each node
+            Dict: Connectivity test result
         """
-        results = {}
+        result = {}
         
-        for url in XRPL_NETWORKS.get(self.network, []):
-            logger.info(f"Testing connectivity to {url}")
+        logger.info(f"Testing connectivity to {self.rpc_url}")
+        
+        try:
+            # Try a simple server_info request
+            response = await self.client.request(ServerInfo())
             
-            try:
-                # Create a temporary client for this URL
-                test_client = AsyncJsonRpcClient(url)
-                
-                # Try a simple server_info request
-                response = await test_client.request(ServerInfo())
-                
-                if response.is_successful():
-                    server_info = response.result.get("info", {})
-                    results[url] = {
-                        "success": True,
-                        "ledger_index": server_info.get("validated_ledger", {}).get("seq", "N/A"),
-                        "build_version": server_info.get("build_version", "N/A"),
-                        "node": server_info.get("node", "N/A"),
-                        "network": server_info.get("network_id", "N/A")
-                    }
-                    logger.info(f"Successfully connected to {url}")
-                else:
-                    results[url] = {
-                        "success": False,
-                        "error": response.result.get("error", "Unknown error")
-                    }
-                    logger.error(f"Failed to connect to {url}: {response.result}")
-                
-                # Close the test client (AsyncJsonRpcClient doesn't have explicit close)
-                # It will be cleaned up by garbage collection
-                
-            except Exception as e:
-                results[url] = {
-                    "success": False,
-                    "error": str(e)
+            if response.is_successful():
+                server_info = response.result.get("info", {})
+                result[self.rpc_url] = {
+                    "success": True,
+                    "ledger_index": server_info.get("validated_ledger", {}).get("seq", "N/A"),
+                    "build_version": server_info.get("build_version", "N/A"),
+                    "node": server_info.get("node", "N/A"),
+                    "network": server_info.get("network_id", "N/A")
                 }
-                logger.error(f"Error testing {url}: {e}")
+                logger.info(f"Successfully connected to {self.rpc_url}")
+            else:
+                result[self.rpc_url] = {
+                    "success": False,
+                    "error": response.result.get("error", "Unknown error")
+                }
+                logger.error(f"Failed to connect to {self.rpc_url}: {response.result}")
+            
+        except Exception as e:
+            result[self.rpc_url] = {
+                "success": False,
+                "error": str(e)
+            }
+            logger.error(f"Error testing {self.rpc_url}: {e}")
         
-        return results
+        return result
 
     async def get_account_info(self, address: str, strict: bool = True) -> Optional[Dict[str, Any]]:
         """
@@ -281,34 +262,12 @@ class XRPLClient:
             logger.error(f"Invalid XRP address: {address}")
             return None
         
-        # Try the current node first
+        # Get account info from the configured node
         result = await self._try_get_account_info(address, strict, self.client)
         if result is not None:
             return result
         
-        # If current node failed, try other nodes
-        logger.warning(f"Current node {self.rpc_url} failed, trying other nodes")
-        for url in XRPL_NETWORKS.get(self.network, []):
-            if url == self.rpc_url:
-                continue  # Skip the one we already tried
-            
-            logger.info(f"Trying node {url}")
-            try:
-                temp_client = AsyncJsonRpcClient(url)
-                result = await self._try_get_account_info(address, strict, temp_client)
-                # No need to close AsyncJsonRpcClient explicitly
-                
-                if result is not None:
-                    logger.info(f"Successfully fetched account info from {url}")
-                    # Update to use this node for future requests
-                    self.client = AsyncJsonRpcClient(url)
-                    self.rpc_url = url
-                    return result
-                    
-            except Exception as e:
-                logger.error(f"Error trying node {url}: {e}")
-        
-        logger.error(f"All nodes failed to get account info for {address}")
+        logger.error(f"Failed to get account info for {address} from {self.rpc_url}")
         return None
     
     async def _try_get_account_info(self, address: str, strict: bool, client: AsyncJsonRpcClient) -> Optional[Dict[str, Any]]:
@@ -819,6 +778,35 @@ class XRPLClient:
             logger.error(f"Error getting NFTs: {e}")
             return None
     
+    async def count_matching_nfts(self, address: str, lp_filters: List[Tuple[str, int]]) -> int:
+        """
+        Count NFTs that match the issuer and taxon filters.
+        
+        Args:
+            address: The XRP wallet address
+            lp_filters: List of (issuer, taxon) tuples to match
+            
+        Returns:
+            Number of matching NFTs
+        """
+        nfts = await self.get_account_nfts(address)
+        if not nfts:
+            return 0
+        
+        count = 0
+        for nft in nfts:
+            nft_issuer = nft.get("Issuer", "")
+            nft_taxon = nft.get("NFTokenTaxon", 0)
+            
+            # Check if this NFT matches any of our filters
+            for issuer, taxon in lp_filters:
+                if nft_issuer == issuer and nft_taxon == taxon:
+                    count += 1
+                    # Count each NFT only once even if it matches multiple filters
+                    break
+        
+        return count
+    
     async def get_account_currencies(self, address: str) -> Optional[Dict[str, List[str]]]:
         """
         Get currencies an account can send and receive.
@@ -942,63 +930,332 @@ class XRPLClient:
             return None
     
     # =========================================================================
-    # CONVENIENCE METHODS FOR BOT INTEGRATION
+    # FAUCET PAYMENT METHODS
     # =========================================================================
+    
+    async def check_trust_line(
+        self,
+        address: str,
+        currency: str,
+        issuer: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Check if an account has a trust line for a specific token.
+        
+        Args:
+            address: The XRP wallet address to check
+            currency: The currency code (e.g., "TXT")
+            issuer: The issuer address
+            
+        Returns:
+            Dict with trust line info or None if not found
+        """
+        if not self.is_valid_address(address):
+            logger.error(f"Invalid XRP address: {address}")
+            return None
+        
+        try:
+            request = AccountLines(
+                account=address,
+                ledger_index="validated",
+                limit=400,
+            )
+            
+            response = await self.client.request(request)
+            
+            if response.is_successful():
+                lines = response.result.get("lines", [])
+                logger.debug(f"Checking {len(lines)} trust lines for {address}")
+                
+                for line in lines:
+                    # Check if this line matches our currency/issuer
+                    line_currency = line.get("currency", "").upper()
+                    line_issuer = line.get("account", "")
+                    
+                    logger.debug(f"Checking line: currency={line_currency}, issuer={line_issuer}")
+                    
+                    # More flexible matching - case insensitive for currency
+                    if line_currency == currency.upper() and line_issuer == issuer:
+                        logger.debug(f"Found matching trust line: {line}")
+                        return {
+                            "currency": line_currency,
+                            "issuer": line_issuer,
+                            "balance": line.get("balance", "0"),
+                            "limit": line.get("limit", "0"),
+                            "limit_peer": line.get("limit_peer", "0"),
+                            "quality_in": line.get("quality_in", "0"),
+                            "quality_out": line.get("quality_out", "0"),
+                            "no_ripple": line.get("no_ripple", False),
+                            "no_ripple_peer": line.get("no_ripple_peer", False),
+                            "authorized": line.get("authorized", False),
+                            "peer_authorized": line.get("peer_authorized", False),
+                        }
+                
+                # Log all lines for debugging
+                logger.debug(f"No matching trust line found for {currency} from {issuer}")
+                logger.debug(f"Available trust lines: {[{'currency': l.get('currency'), 'issuer': l.get('account')} for l in lines[:5]]}")
+                
+                # Trust line not found
+                return None
+            else:
+                logger.error(f"AccountLines failed: {response.result.get('error_message')}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error checking trust line: {e}")
+            return None
+    
+    async def send_payment(
+        self,
+        from_wallet: Wallet,
+        to_address: str,
+        amount: Union[str, Decimal],
+        currency: str = "XRP",
+        issuer: Optional[str] = None,
+        memo: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Send a payment from one wallet to another.
+        
+        Args:
+            from_wallet: The source wallet (with private key)
+            to_address: The destination address
+            amount: Amount to send (as string or Decimal)
+            currency: Currency code ("XRP" or issued currency)
+            issuer: Required for issued currencies
+            memo: Optional memo to include
+            
+        Returns:
+            Dict with transaction result or None on failure
+        """
+        if not self.is_valid_address(to_address):
+            logger.error(f"Invalid destination address: {to_address}")
+            return None
+        
+        try:
+            # Build the payment transaction
+            if currency == "XRP":
+                # XRP payment
+                payment_dict = {
+                    "account": from_wallet.address,
+                    "destination": to_address,
+                    "amount": self.xrp_to_drops(str(amount)),
+                }
+            else:
+                # Issued currency payment
+                if not issuer:
+                    raise ValueError("Issuer is required for issued currency payments")
+                
+                payment_dict = {
+                    "account": from_wallet.address,
+                    "destination": to_address,
+                    "amount": {
+                        "currency": currency,
+                        "value": str(amount),
+                        "issuer": issuer,
+                    },
+                }
+            
+            # Add memo if provided
+            if memo:
+                payment_dict["memos"] = [{
+                    "memo": {
+                        "memo_data": memo.encode('utf-8').hex()
+                    }
+                }]
+            
+            # Create and sign the transaction
+            payment_tx = Payment.from_dict(payment_dict)
+            payment_tx.sign(from_wallet)
+            
+            # Submit the transaction
+            response = await self.client.request_submit(payment_tx)
+            
+            if response.is_successful():
+                result = response.result
+                logger.info(f"Payment sent: {result.get('hash')} from {from_wallet.address} to {to_address}")
+                
+                # Wait for validation
+                try:
+                    # Check transaction status
+                    tx_result = await self.get_transaction(result.get('hash'))
+                    if tx_result and tx_result.get('meta', {}).get('TransactionResult') == 'tesSUCCESS':
+                        return {
+                            "success": True,
+                            "tx_hash": result.get('hash'),
+                            "ledger_index": result.get('ledger_index'),
+                            "amount": str(amount),
+                            "currency": currency,
+                            "destination": to_address,
+                            "explorer_url": f"https://xrpscan.com/tx/{result.get('hash')}" if self.network == "mainnet" 
+                                          else f"https://testnet.xrpscan.com/tx/{result.get('hash')}"
+                        }
+                    else:
+                        return {
+                            "success": False,
+                            "error": "Transaction failed validation",
+                            "tx_hash": result.get('hash'),
+                            "result": tx_result.get('meta', {}).get('TransactionResult') if tx_result else 'Unknown'
+                        }
+                except Exception as e:
+                    logger.warning(f"Could not verify transaction status: {e}")
+                    # Still return success as it was submitted
+                    return {
+                        "success": True,
+                        "tx_hash": result.get('hash'),
+                        "ledger_index": result.get('ledger_index'),
+                        "amount": str(amount),
+                        "currency": currency,
+                        "destination": to_address,
+                        "explorer_url": f"https://xrpscan.com/tx/{result.get('hash')}" if self.network == "mainnet" 
+                                      else f"https://testnet.xrpscan.com/tx/{result.get('hash')}",
+                        "warning": "Could not verify final status"
+                    }
+            else:
+                error_msg = response.result.get('error_message', 'Unknown error')
+                logger.error(f"Payment failed: {error_msg}")
+                return {
+                    "success": False,
+                    "error": error_msg,
+                    "error_code": response.result.get('error_code'),
+                    "error_details": response.result
+                }
+                
+        except Exception as e:
+            logger.error(f"Error sending payment: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+    
+    async def prepare_trust_set_transaction(
+        self,
+        wallet: Wallet,
+        currency: str,
+        issuer: str,
+        limit: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Prepare a TrustSet transaction for a user to sign.
+        
+        Args:
+            wallet: The wallet that will create the trust line
+            currency: The currency code (e.g., "TXT")
+            issuer: The issuer address
+            limit: Maximum amount to trust (defaults to 1000000000)
+            
+        Returns:
+            Dict with transaction JSON for signing
+        """
+        try:
+            if not limit:
+                # Default to 1 billion tokens
+                limit = "1000000000"
+            
+            trust_set_dict = {
+                "TransactionType": "TrustSet",
+                "Account": wallet.address,
+                "LimitAmount": {
+                    "currency": currency,
+                    "issuer": issuer,
+                    "value": limit,
+                },
+                "Fee": "12",  # Minimum fee
+                "Sequence": await self._get_next_sequence(wallet.address)
+            }
+            
+            # Get current ledger info
+            ledger_info = await self.get_ledger_info()
+            if ledger_info:
+                trust_set_dict["LedgerIndex"] = ledger_info.get("ledger_index")
+                trust_set_dict["LastLedgerSequence"] = ledger_info.get("ledger_index") + 10
+            
+            return {
+                "success": True,
+                "transaction_json": trust_set_dict,
+                "signing_instructions": "Sign this transaction with your wallet (e.g., Xaman) to establish the trust line"
+            }
+            
+        except Exception as e:
+            logger.error(f"Error preparing TrustSet: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+    
+    async def _get_next_sequence(self, address: str) -> Optional[int]:
+        """Get the next sequence number for an account."""
+        try:
+            account_info = await self.get_account_info(address)
+            if account_info:
+                return account_info.get("Sequence", 0)
+            return None
+        except Exception as e:
+            logger.error(f"Error getting sequence: {e}")
+            return None
     
     async def get_wallet_summary(self, address: str) -> str:
         """
-        Get a formatted wallet summary for bot display.
-        
-        This is a convenience method that returns a nicely formatted
-        summary of an account for chat bot responses.
+        Get a formatted wallet summary for display in chat.
         
         Args:
             address: The XRP wallet address
             
         Returns:
-            str: Formatted wallet summary
+            Formatted string with wallet information
         """
-        # Validate address
-        if not self.is_valid_address(address):
-            return f"❌ Invalid XRP address: `{address}`"
-        
-        # Get account info
-        account_info = await self.get_account_info(address)
-        
-        if account_info is None:
-            return (
-                f"⚠️ Account not found or not activated.\n"
-                f"Address: `{address}`\n"
-                f"Note: XRP accounts require a minimum of 10 XRP to activate."
-            )
-        
-        # Get reserve info
-        reserve_info = await self.get_account_reserve(address)
-        
-        # Format the summary
-        balance = self.drops_to_xrp(account_info.get("Balance", "0"))
-        sequence = account_info.get("Sequence", 0)
-        owner_count = account_info.get("OwnerCount", 0)
-        
-        summary = f"""💰 **Wallet Summary**
+        try:
+            # Get basic account info
+            account_info = await self.get_account_info(address)
+            if not account_info:
+                return f"❌ Account not found or not activated: `{address}`"
+            
+            balance = self.drops_to_xrp(account_info.get("Balance", "0"))
+            sequence = account_info.get("Sequence", "N/A")
+            
+            # Get trust lines
+            trust_lines = await self.get_account_trust_lines(address, limit=20)
+            
+            # Format the response
+            response = f"""💰 **Wallet Summary**
 ━━━━━━━━━━━━━━━━━━━━━
 **Address:** `{address}`
-**Network:** {self.network.upper()}
-
 **Balance:** {balance:,.6f} XRP
 **Sequence:** {sequence}
-**Objects Owned:** {owner_count}
+
 """
-        
-        if reserve_info:
-            summary += f"""
-**Reserves:**
-  • Base Reserve: {reserve_info['base_reserve']} XRP
-  • Owner Reserve: {reserve_info['owner_reserve']} XRP
-  • **Available:** {reserve_info['available_balance']:,.6f} XRP
-"""
-        
-        return summary
+            
+            if trust_lines and len(trust_lines) > 0:
+                response += f"**Trust Lines ({len(trust_lines)}):**\n"
+                
+                # Show non-zero balances first
+                non_zero = [l for l in trust_lines if float(l.get("balance", 0)) != 0]
+                zero = [l for l in trust_lines if float(l.get("balance", 0)) == 0]
+                
+                for line in (non_zero + zero)[:10]:  # Show max 10
+                    currency = line.get("currency", "???")
+                    if len(currency) > 3:
+                        try:
+                            currency = bytes.fromhex(currency).decode('utf-8').rstrip('\x00')
+                        except:
+                            currency = currency[:8] + "..."
+                    
+                    balance_val = float(line.get("balance", 0))
+                    if balance_val != 0:
+                        response += f"  • {currency}: {balance_val:,.6f}\n"
+                    else:
+                        response += f"  • {currency}: (no balance)\n"
+                
+                if len(trust_lines) > 10:
+                    response += f"  _...and {len(trust_lines) - 10} more_\n"
+            else:
+                response += "**Trust Lines:** None (XRP only)\n"
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error getting wallet summary: {e}")
+            return f"❌ Error fetching wallet summary: {str(e)}"
     
     async def check_account_exists(self, address: str) -> bool:
         """

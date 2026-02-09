@@ -1,15 +1,16 @@
 # TextRP Chatbot Template
 
-A comprehensive Python chatbot template for [TextRP](https://textrp.io/). Features XRPL (XRP Ledger) wallet balance queries and weather information retrieval.
+A comprehensive chatbot template for TextRP with XRPL integration, weather services, and **built-in faucet functionality**.
 
 ## Features
 
-- **Full TextRP Support** - Complete implementation of TextRP room operations
-- **XRP Wallet Integration** - TextRP user IDs are XRP wallet addresses
-- **XRPL Wallet Queries** - Check XRP balances, account info, trust lines, NFTs, and more
-- **Weather Information** - Fetch weather by city name or ZIP code via OpenWeatherMap API
-- **Extensible Command System** - Easy-to-use decorators for adding custom commands
-- **Production Ready** - Graceful shutdown, signal handling, and comprehensive logging
+- **TextRP Integration** - Native Matrix-based messaging on TextRP
+- **XRPL Wallet Support** - Query balances, trust lines, NFTs, and more
+- **Weather Services** - Get weather updates by city or ZIP code
+- **🆕 Faucet Bot Mode** - Distribute tokens to new users with anti-abuse protection
+- **Command System** - Easy to extend with custom commands
+- **Event Handling** - Respond to room events, member joins, etc.
+- **Async Architecture** - Built on asyncio for high performance
 
 ## Project Structure
 
@@ -17,12 +18,16 @@ A comprehensive Python chatbot template for [TextRP](https://textrp.io/). Featur
 textrp-chatbot/
 ├── main.py              # Main entry point with bot application
 ├── textrp_chatbot.py    # TextRP protocol client with all room methods
-├── xrpl_utils.py        # XRPL client for wallet queries
+├── xrpl_utils.py        # XRPL client for wallet queries and payments
 ├── weather_utils.py     # Weather API client
+├── faucet_db.py         # SQLite database for faucet claims
 ├── config.yaml          # Configuration template
 ├── .env.example         # Environment variables template
 ├── requirements.txt     # Python dependencies
-└── README.md            # This file
+├── README.md            # This file
+├── README-FAUCET.md     # Detailed faucet documentation
+├── quickstart.py        # Quick setup script
+└── test_faucet.py       # Faucet configuration test
 ```
 
 ## Quick Start
@@ -406,3 +411,53 @@ MIT License - See LICENSE file for details.
 - **TextRP**: Join the TextRP community for support
 - **Issues**: Open an issue on GitHub
 - **Documentation**: See inline code comments for detailed API docs
+
+## 🆕 Faucet Bot Mode
+
+This template includes a complete faucet bot implementation for distributing tokens to TextRP users. See [README-FAUCET.md](README-FAUCET.md) for detailed setup instructions.
+
+### Quick Faucet Setup
+
+1. Configure faucet settings in `.env`:
+   ```env
+   FAUCET_COLD_WALLET=rYourColdWallet...      # Token issuer
+   FAUCET_HOT_WALLET=rYourHotWallet...       # Distribution wallet
+   FAUCET_HOT_WALLET_SEED=sYourSeed...       # Hot wallet secret
+   FAUCET_DAILY_AMOUNT=100                   # Tokens per claim
+   FAUCET_WELCOME_ROOM=!welcome:room.id      # Auto-invite room
+   ```
+
+2. Run the quick setup script:
+   ```bash
+   python quickstart.py
+   ```
+
+3. Test your configuration:
+   ```bash
+   python test_faucet.py
+   ```
+
+4. Start the bot:
+   ```bash
+   python main.py
+   ```
+
+### Faucet Features
+
+- **Auto-DM & Welcome** - New users get personalized DM with complete setup guide
+- **Daily Claims** - Users can claim tokens once every 24 hours
+- **Trust Line Verification** - Ensures users can receive tokens before claiming
+- **Anti-Abuse Protection** - Multiple security layers including cooldowns and blacklisting
+- **Admin Commands** - Full control with statistics and balance monitoring
+
+### Faucet Commands
+
+| Command | Description | Usage |
+|---------|-------------|-------|
+| `!faucet` | Claim daily tokens | `!faucet` |
+| `!trust TXT` | Check trust line | `!trust TXT` |
+| `!guide` | Trust line setup guide | `!guide` |
+| `!faucetstats` | View statistics (admin) | `!faucetstats` |
+| `!faucetbalance` | Check balances (admin) | `!faucetbalance` |
+
+For complete faucet documentation, see [README-FAUCET.md](README-FAUCET.md).
