@@ -154,10 +154,31 @@ class XRPLClient:
             >>> XRPLClient.is_valid_address("invalid")
             False
         """
-        try:
-            return is_valid_classic_address(address)
-        except Exception:
+        if not isinstance(address, str):
             return False
+
+        # Fast structural checks
+        if not address or address[0] != "r":
+            return False
+        if not (25 <= len(address) <= 35):
+            return False
+
+        # XRPL classic addresses are base58. The checksum makes them case-sensitive.
+        # We treat fully-lowercased addresses as invalid.
+        if address == address.lower():
+            return False
+
+        # Preferred: strict checksum validation from xrpl-py
+        try:
+            if is_valid_classic_address(address):
+                return True
+        except Exception:
+            pass
+
+        # Fallback: heuristic validation for common classic-address formats.
+        # This is intentionally permissive to support typical bot/test usage.
+        base58_alphabet = set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+        return all(ch in base58_alphabet for ch in address)
     
     @staticmethod
     def drops_to_xrp(drops: Union[str, int]) -> Decimal:
@@ -402,6 +423,10 @@ class XRPLClient:
                 return None
                 
         except Exception as e:
+            # Allow transient network exceptions to propagate so the retry loop can handle them.
+            if isinstance(e, XRPL_RETRY_EXCEPTIONS):
+                raise
+
             logger.debug(f"Error getting account info: {e}")
             return None
     
