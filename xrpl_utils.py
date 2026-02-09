@@ -22,6 +22,7 @@ from decimal import Decimal
 from datetime import datetime
 
 from xrpl.asyncio.clients import AsyncJsonRpcClient
+from xrpl.asyncio.transaction import sign_and_submit, submit_and_wait
 from xrpl.models.requests import (
     AccountInfo,
     AccountLines,
@@ -36,6 +37,7 @@ from xrpl.models.requests import (
     Ledger,
 )
 from xrpl.models.response import Response
+from xrpl.models.transactions import Payment
 from xrpl.utils import drops_to_xrp, xrp_to_drops
 from xrpl.core.addresscodec import is_valid_classic_address
 
@@ -662,6 +664,188 @@ class XRPLClient:
                 })
         
         return balances
+
+    async def check_trust_line(
+        self,
+        address: str,
+        currency: str,
+        issuer: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Check if an account has a trust line for a specific token."""
+        if not self.is_valid_address(address):
+            logger.error(f"Invalid XRP address: {address}")
+            return None
+
+        if not self.is_valid_address(issuer):
+            logger.error(f"Invalid issuer address: {issuer}")
+            return None
+
+        request = AccountLines(
+            account=address,
+            ledger_index="validated",
+            limit=400,
+        )
+
+        async def _try(client: AsyncJsonRpcClient) -> Optional[Dict[str, Any]]:
+            response = await client.request(request)
+            if not response.is_successful():
+                # Some public endpoints (notably xrplcluster) rate-limit (HTTP 429).
+                # xrpl-py surfaces this as an error message.
+                err = response.result.get("error_message") or response.result.get("error")
+                raise RuntimeError(err or "AccountLines request failed")
+
+            lines = response.result.get("lines", [])
+            for line in lines:
+                line_currency = line.get("currency", "").upper()
+                line_issuer = line.get("account", "")
+                if line_currency == currency.upper() and line_issuer == issuer:
+                    return {
+                        "currency": line_currency,
+                        "issuer": line_issuer,
+                        "balance": line.get("balance", "0"),
+                        "limit": line.get("limit", "0"),
+                        "limit_peer": line.get("limit_peer", "0"),
+                        "quality_in": line.get("quality_in", "0"),
+                        "quality_out": line.get("quality_out", "0"),
+                        "no_ripple": line.get("no_ripple", False),
+                        "no_ripple_peer": line.get("no_ripple_peer", False),
+                        "authorized": line.get("authorized", False),
+                        "peer_authorized": line.get("peer_authorized", False),
+                    }
+            return None
+
+        # Try current node first
+        try:
+            return await _try(self.client)
+        except Exception as e:
+            msg = str(e)
+            logger.warning(f"Trust line check failed on {self.rpc_url}: {msg}")
+
+            # If current node failed, try other nodes (rate limits, transient errors)
+            for url in XRPL_NETWORKS.get(self.network, []):
+                if url == self.rpc_url:
+                    continue
+                try:
+                    temp_client = AsyncJsonRpcClient(url)
+                    result = await _try(temp_client)
+
+                    # Success (even if trustline not found). Switch to this node for future requests.
+                    self.client = temp_client
+                    self.rpc_url = url
+                    return result
+                except Exception as e2:
+                    logger.debug(f"Trust line check failed on {url}: {e2}")
+
+            logger.error(
+                "Error checking trust line: all nodes failed. "
+                "If you see HTTP 429 / rate limit errors, set XRPL_RPC_URL to your own node. "
+                f"Last error: {msg}"
+            )
+            return None
+
+    async def send_payment(
+        self,
+        from_wallet,
+        to_address: str,
+        amount: Union[str, Decimal],
+        currency: str = "XRP",
+        issuer: Optional[str] = None,
+        memo: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Send a payment from one wallet to another."""
+        if not self.is_valid_address(to_address):
+            logger.error(f"Invalid destination address: {to_address}")
+            return None
+
+        try:
+            if currency == "XRP":
+                payment_dict: Dict[str, Any] = {
+                    "account": from_wallet.classic_address,
+                    "destination": to_address,
+                    "amount": self.xrp_to_drops(str(amount)),
+                }
+            else:
+                if not issuer:
+                    raise ValueError("Issuer is required for issued currency payments")
+
+                payment_dict = {
+                    "account": from_wallet.classic_address,
+                    "destination": to_address,
+                    "amount": {
+                        "currency": currency,
+                        "value": str(amount),
+                        "issuer": issuer,
+                    },
+                }
+
+            if memo:
+                payment_dict["memos"] = [
+                    {
+                        "memo": {
+                            "memo_data": memo.encode("utf-8").hex(),
+                        }
+                    }
+                ]
+
+            payment_tx = Payment.from_dict(payment_dict)
+
+            # Sign + submit (xrpl-py)
+            submit_response = await sign_and_submit(payment_tx, self.client, from_wallet)
+
+            if not submit_response.is_successful():
+                error_msg = submit_response.result.get("error_message", "Unknown error")
+                logger.error(f"Payment failed: {error_msg}")
+                return {
+                    "success": False,
+                    "error": error_msg,
+                    "error_code": submit_response.result.get("error_code"),
+                    "error_details": submit_response.result,
+                }
+
+            tx_hash = submit_response.result.get("tx_json", {}).get("hash") or submit_response.result.get("hash")
+
+            if tx_hash:
+                try:
+                    validated = await submit_and_wait(payment_tx, self.client)
+                    if validated.is_successful():
+                        meta = validated.result.get("meta", {})
+                        if meta.get("TransactionResult") == "tesSUCCESS":
+                            return {
+                                "success": True,
+                                "tx_hash": tx_hash,
+                                "amount": str(amount),
+                                "currency": currency,
+                                "destination": to_address,
+                                "explorer_url": (
+                                    f"https://xrpscan.com/tx/{tx_hash}"
+                                    if self.network == "mainnet"
+                                    else f"https://testnet.xrpscan.com/tx/{tx_hash}"
+                                ),
+                            }
+                except Exception as e:
+                    logger.warning(f"Could not verify transaction status: {e}")
+
+            return {
+                "success": True,
+                "tx_hash": tx_hash,
+                "amount": str(amount),
+                "currency": currency,
+                "destination": to_address,
+                "explorer_url": (
+                    f"https://xrpscan.com/tx/{tx_hash}"
+                    if self.network == "mainnet"
+                    else f"https://testnet.xrpscan.com/tx/{tx_hash}"
+                )
+                if tx_hash
+                else None,
+                "warning": "Submitted but could not verify final status",
+            }
+        except Exception as e:
+            logger.error(f"Error sending payment: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
     
     # =========================================================================
     # TRANSACTION HISTORY

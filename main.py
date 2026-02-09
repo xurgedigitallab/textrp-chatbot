@@ -185,9 +185,18 @@ class TextRPBot:
         
         # Initialize faucet wallet if configured
         self.faucet_wallet = None
-        if config.faucet_wallet_seed:
-            self.faucet_wallet = Wallet.from_seed(config.faucet_wallet_seed)
-            logger.info(f"Faucet wallet initialized: {self.faucet_wallet.classic_address}")
+        seed = (config.faucet_wallet_seed or "").strip()
+        if seed:
+            try:
+                self.faucet_wallet = Wallet.from_seed(seed)
+                logger.info(f"Faucet wallet initialized: {self.faucet_wallet.classic_address}")
+            except Exception as e:
+                logger.error(
+                    "Invalid faucet wallet seed. Faucet commands will be disabled. "
+                    "Please check FAUCET_WALLET_SEED / FAUCET_HOT_WALLET_SEED in your .env. "
+                    f"Error: {e}"
+                )
+                self.faucet_wallet = None
         else:
             logger.warning("Faucet wallet seed not configured. Faucet commands will not work.")
         
