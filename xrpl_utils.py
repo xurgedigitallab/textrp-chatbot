@@ -741,7 +741,7 @@ class XRPLClient:
                 "If you see HTTP 429 / rate limit errors, set XRPL_RPC_URL to your own node. "
                 f"Last error: {msg}"
             )
-            return None
+            raise RuntimeError(msg)
 
     async def send_payment(
         self,
