@@ -24,6 +24,8 @@ Usage:
 import asyncio
 import logging
 import os
+import html
+import re
 from typing import Optional, List, Dict, Any, Callable, Union
 from datetime import datetime
 
@@ -776,17 +778,23 @@ class TextRPChatbot:
             ...     message="Hello, XRP community!"
             ... )
         """
-        # Build the message content
+        plain_body = message
+        html_body = formatted_body
+
+        if html_body is None:
+            plain_body, html_body = self._render_message_bodies(message)
+
+        # Message content following Matrix spec
         content = {
             "msgtype": msgtype,
-            "body": message,
+            "body": plain_body,
         }
-        
+
         # Add formatted body if provided (HTML formatting)
-        if formatted_body:
+        if html_body:
             content["format"] = "org.matrix.custom.html"
-            content["formatted_body"] = formatted_body
-        
+            content["formatted_body"] = html_body
+
         # Add reply relation if replying to a message
         if reply_to_event_id:
             content["m.relates_to"] = {
@@ -794,22 +802,86 @@ class TextRPChatbot:
                     "event_id": reply_to_event_id
                 }
             }
-        
+
         async def _send():
             response = await self.client.room_send(
                 room_id=room_id,
                 message_type="m.room.message",
                 content=content,
             )
-            
+
             if isinstance(response, RoomSendError):
                 logger.error(f"Failed to send message: {response.message}")
                 return None
-            
+
             logger.debug(f"Message sent to {room_id}: {message[:50]}...")
             return response.event_id
-        
+
         return await _send()
+
+    def _render_message_bodies(self, message: str) -> tuple[str, Optional[str]]:
+        plain = self._markdownish_to_plain(message)
+        html_version = self._markdownish_to_html(message)
+        if html_version is None:
+            return message, None
+
+        return plain, html_version
+
+    def _markdownish_to_plain(self, text: str) -> str:
+        if not text:
+            return text
+
+        t = text
+        t = re.sub(r"```[\s\S]*?```", lambda m: m.group(0)[3:-3].strip("\n"), t)
+        t = re.sub(r"`([^`]+)`", r"\1", t)
+        t = re.sub(r"\*\*([^*]+)\*\*", r"\1", t)
+        t = re.sub(r"\*([^*]+)\*", r"\1", t)
+        t = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", t)
+        return t
+
+    def _markdownish_to_html(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+
+        has_markup = any(tok in text for tok in ("```", "`", "**", "["))
+        if not has_markup:
+            return None
+
+        parts: list[str] = []
+        i = 0
+        while True:
+            start = text.find("```", i)
+            if start == -1:
+                parts.append(self._inline_markdownish_to_html(text[i:]))
+                break
+
+            parts.append(self._inline_markdownish_to_html(text[i:start]))
+            end = text.find("```", start + 3)
+            if end == -1:
+                parts.append(self._inline_markdownish_to_html(text[start:]))
+                break
+
+            code = text[start + 3 : end].strip("\n")
+            parts.append(f"<pre><code>{html.escape(code)}</code></pre>")
+            i = end + 3
+
+        html_text = "".join(parts)
+        html_text = html_text.replace("\n", "<br/>")
+        return html_text
+
+    def _inline_markdownish_to_html(self, text: str) -> str:
+        escaped = html.escape(text)
+
+        def _link_sub(m: re.Match) -> str:
+            label = html.escape(m.group(1))
+            url = html.escape(m.group(2), quote=True)
+            return f'<a href="{url}">{label}</a>'
+
+        escaped = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _link_sub, escaped)
+        escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
+        escaped = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", escaped)
+        escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+        return escaped
     
     async def send_notice(self, room_id: str, message: str) -> Optional[str]:
         """

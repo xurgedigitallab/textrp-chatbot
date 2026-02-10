@@ -268,14 +268,15 @@ class TextRPBot:
 • `{self.config.command_prefix}lp` - Show LP NFT collection status and multiplier
 
 **XRPL / Wallet:**
-• `{self.config.command_prefix}balance [address]` - Check XRP and TXT wallet balance
-• `{self.config.command_prefix}tokens [address]` - Show token balances
+• `{self.config.command_prefix}balance` - Check your XRP balance
+• `{self.config.command_prefix}tokens` - Show your token balances
 
 **Examples:**
-• `{self.config.command_prefix}balance rN7n3473SaZBCG4dFL83w7a1RXtXtbk2D9`
+• `{self.config.command_prefix}balance`
 • `{self.config.command_prefix}trust`
 • `{self.config.command_prefix}lp`
 • `{self.config.command_prefix}faucet`
+• `{self.config.command_prefix}tokens`
 """
             await self.textrp.send_message(room.room_id, help_text)
         
@@ -427,25 +428,21 @@ class TextRPBot:
             """
             Check XRP wallet balance.
             
-            Usage: !balance [address]
-            If no address provided, uses sender's wallet from TextRP ID.
+            Usage: !balance
+            Uses sender's wallet from TextRP ID.
             """
             # Show typing indicator while processing
             await self.textrp.send_typing(room.room_id, True)
             
-            # Determine which address to check
-            address = args.strip() if args.strip() else None
-            
-            if not address:
-                # Try to extract from sender's TextRP ID
-                address = self.textrp.get_user_wallet_address(event.sender)
-            
+            # Always use sender's wallet (ignore any provided args)
+            address = self.textrp.get_user_wallet_address(event.sender)
+
             if not address:
                 await self.textrp.send_message(
                     room.room_id,
-                    f"❌ Please provide a wallet address.\n"
-                    f"Usage: `{self.config.command_prefix}balance <xrp_address>`"
+                    "❌ Could not extract your wallet address from your TextRP ID."
                 )
+                await self.textrp.send_typing(room.room_id, False)
                 return
             
             # Validate address
@@ -455,6 +452,7 @@ class TextRPBot:
                     f"❌ Invalid XRP address: `{address}`\n"
                     f"XRP addresses start with 'r' and are 25-35 characters."
                 )
+                await self.textrp.send_typing(room.room_id, False)
                 return
             
             # Fetch balance
@@ -503,21 +501,18 @@ class TextRPBot:
             """
             Show non-zero token balances for a wallet.
             
-            Usage: !tokens [address]
+            Usage: !tokens
             Similar to !trustlines but only shows tokens with balance > 0.
             """
             await self.textrp.send_typing(room.room_id, True)
-            
-            address = args.strip() if args.strip() else None
-            
-            if not address:
-                address = self.textrp.get_user_wallet_address(event.sender)
-            
+
+            # Always use sender's wallet (ignore any provided args)
+            address = self.textrp.get_user_wallet_address(event.sender)
+
             if not address:
                 await self.textrp.send_message(
                     room.room_id,
-                    f"❌ Please provide a wallet address.\n"
-                    f"Usage: `{self.config.command_prefix}tokens <xrp_address>`"
+                    "❌ Could not extract your wallet address from your TextRP ID."
                 )
                 await self.textrp.send_typing(room.room_id, False)
                 return
@@ -879,17 +874,112 @@ Please create a trust line to receive tokens."""
             await self.textrp.send_typing(room.room_id, True)
             
             try:
+                lp_info_raw = os.getenv("LP_INFO", "").strip()
+
+                if not lp_info_raw:
+                    await self.textrp.send_message(
+                        room.room_id,
+                        "❌ LP_INFO is not configured. Ask an admin to set LP_INFO in the bot environment."
+                    )
+                    return
+
+                configured: list[tuple[str, int]] = []
+                invalid_entries: list[str] = []
+                for entry in [e.strip() for e in lp_info_raw.split(",") if e.strip()]:
+                    if ":" not in entry:
+                        invalid_entries.append(entry)
+                        continue
+
+                    issuer, taxon_str = [p.strip() for p in entry.split(":", 1)]
+                    if not issuer or not taxon_str:
+                        invalid_entries.append(entry)
+                        continue
+
+                    try:
+                        taxon = int(taxon_str)
+                    except ValueError:
+                        invalid_entries.append(entry)
+                        continue
+
+                    if not self.xrpl.is_valid_address(issuer):
+                        invalid_entries.append(entry)
+                        continue
+
+                    configured.append((issuer, taxon))
+
+                if not configured:
+                    await self.textrp.send_message(
+                        room.room_id,
+                        "❌ LP_INFO is configured but no valid entries were found. "
+                        "Expected format: issuer:taxon,issuer:taxon"
+                    )
+                    return
+
+                nfts = await self.xrpl.get_account_nfts(user_wallet)
+                if nfts is None:
+                    await self.textrp.send_message(
+                        room.room_id,
+                        "⚠️ Could not fetch your NFTs from XRPL right now. Please try again later."
+                    )
+                    return
+
+                owned_pairs: set[tuple[str, int]] = set()
+                for nft in nfts:
+                    nft_issuer = nft.get("Issuer") or nft.get("issuer")
+                    nft_taxon_raw = nft.get("NFTokenTaxon") if "NFTokenTaxon" in nft else nft.get("nft_taxon")
+                    if not nft_issuer or nft_taxon_raw is None:
+                        continue
+
+                    try:
+                        nft_taxon = int(nft_taxon_raw)
+                    except (TypeError, ValueError):
+                        continue
+
+                    owned_pairs.add((str(nft_issuer), nft_taxon))
+
+                configured_set = set(configured)
+                matched = configured_set.intersection(owned_pairs)
+
+                nft_count = len(matched)
+                if nft_count <= 0:
+                    multiplier = 1.0
+                elif nft_count == 1:
+                    multiplier = 1.5
+                else:
+                    multiplier = float(nft_count)
+
+                base_amount = float(self.config.faucet_daily_amount)
+                with_bonus = int(round(base_amount * multiplier))
+
                 msg = f"""🎫 **LP NFT Status**
 ━━━━━━━━━━━━━━━━━━━━━
 
-**NFTs Owned:** 0
-**Faucet Multiplier:** 1.0× (no bonus)
+**Configured LP NFTs:** {len(configured_set)}
+**LP NFTs Owned:** {nft_count}
+**Faucet Multiplier:** {multiplier}×
 
 **Base Amount:** {self.config.faucet_daily_amount} {self.config.faucet_currency_code}
-**With Bonus:** {self.config.faucet_daily_amount} {self.config.faucet_currency_code}
+**With Bonus:** {with_bonus} {self.config.faucet_currency_code}
+"""
 
-LP NFT functionality is not fully configured in this version."""
-                
+                if invalid_entries:
+                    msg += "\n⚠️ **Invalid LP_INFO entries (ignored):**\n"
+                    for bad in invalid_entries[:10]:
+                        msg += f"• `{bad}`\n"
+
+                if matched:
+                    msg += "\n✅ **Matched collections:**\n"
+                    for issuer, taxon in sorted(matched):
+                        msg += f"• Issuer `{issuer}` Taxon `{taxon}`\n"
+                else:
+                    msg += "\n❌ **No configured LP NFTs found** in your wallet.\n"
+
+                missing = configured_set.difference(matched)
+                if missing:
+                    msg += "\n📭 **Missing collections:**\n"
+                    for issuer, taxon in sorted(missing):
+                        msg += f"• Issuer `{issuer}` Taxon `{taxon}`\n"
+
                 await self.textrp.send_message(room.room_id, msg)
                 
             except Exception as e:
