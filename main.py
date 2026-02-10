@@ -81,6 +81,7 @@ class BotConfig:
         )
         self.textrp_access_token = os.getenv("TEXTRP_ACCESS_TOKEN", "")
         self.textrp_device_name = os.getenv("TEXTRP_DEVICE_NAME", "TextRP Bot")
+        self.textrp_device_id = os.getenv("TEXTRP_DEVICE_ID", "")
         self.textrp_room_id = os.getenv("TEXTRP_ROOM_ID")
         
         # XRPL configuration
@@ -204,6 +205,7 @@ class TextRPBot:
             username=config.textrp_username,
             access_token=config.textrp_access_token,
             device_name=config.textrp_device_name,
+            device_id=config.textrp_device_id or None,
             invalidate_token_on_shutdown=config.invalidate_token_on_shutdown
         )
         self.textrp.command_prefix = config.command_prefix

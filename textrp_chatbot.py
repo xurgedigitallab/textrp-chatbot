@@ -22,6 +22,7 @@ Usage:
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 from typing import Optional, List, Dict, Any, Callable, Union
@@ -158,6 +159,7 @@ class TextRPChatbot:
         username: str,
         access_token: str = None,
         device_name: str = "TextRP Bot",
+        device_id: Optional[str] = None,
         store_path: str = "./textrp_store",
         invalidate_token_on_shutdown: bool = False,
         config: Optional[AsyncClientConfig] = None
@@ -170,6 +172,7 @@ class TextRPChatbot:
             username: Full Matrix user ID (e.g., @wallet_address:matrix.textrp.io)
             access_token: Access token for authentication
             device_name: Human-readable device name for this session
+            device_id: Stable device ID for E2EE key persistence (auto-generated if omitted)
             store_path: Directory path for storing sync tokens and encryption keys
             config: Optional AsyncClientConfig for advanced configuration
         """
@@ -182,6 +185,9 @@ class TextRPChatbot:
         
         # Ensure store directory exists for persistent state
         os.makedirs(store_path, exist_ok=True)
+        
+        # Resolve a stable device_id for E2EE key persistence
+        self.device_id = self._resolve_device_id(device_id)
         
         # Default client configuration with encryption support
         if config is None:
@@ -197,7 +203,7 @@ class TextRPChatbot:
         self.client = AsyncClient(
             homeserver,
             user=self.username,
-            device_id=None,  # Will be assigned on login
+            device_id=self.device_id,
             store_path=self.store_path,
             config=client_config,
         )
@@ -255,6 +261,65 @@ class TextRPChatbot:
         
         logger.info(f"TextRPChatbot initialized for {username} on {homeserver}")
     
+    # =========================================================================
+    # DEVICE ID PERSISTENCE
+    # =========================================================================
+
+    def _resolve_device_id(self, provided_id: Optional[str] = None) -> str:
+        """
+        Resolve a stable device_id for E2EE key persistence.
+
+        Priority: provided_id > saved file > auto-generated.
+        The resolved ID is saved to store_path/device_id for future runs.
+        """
+        device_id_file = os.path.join(self.store_path, "device_id")
+
+        if provided_id:
+            resolved = provided_id.strip()
+        elif os.path.isfile(device_id_file):
+            resolved = open(device_id_file).read().strip()
+            logger.info(f"Loaded persisted device_id: {resolved}")
+        else:
+            tag = hashlib.sha256(self.username.encode()).hexdigest()[:8].upper()
+            resolved = f"TXTRP_{tag}"
+            logger.info(f"Generated new device_id: {resolved}")
+
+        # Persist for next run
+        with open(device_id_file, "w") as f:
+            f.write(resolved)
+
+        return resolved
+
+    async def _upload_keys_if_needed(self) -> None:
+        """Upload Olm identity keys and one-time keys to the homeserver if needed."""
+        try:
+            if self.client.should_upload_keys:
+                logger.info("Uploading E2EE device keys to homeserver...")
+                response = await self.client.keys_upload()
+                logger.info(f"Keys upload response: {response}")
+            else:
+                logger.info("E2EE keys already uploaded, no upload needed")
+        except Exception as e:
+            logger.error(f"Failed to upload E2EE keys: {e}")
+
+    async def _auto_trust_room_devices(self) -> None:
+        """Auto-trust all devices for all users in joined encrypted rooms."""
+        try:
+            for room_id, room in self.client.rooms.items():
+                if not room.encrypted:
+                    continue
+                for user_id in room.users:
+                    devices = self.client.device_store.active_user_devices(user_id)
+                    for device in devices:
+                        if device.trust_state == TrustState.unset:
+                            self.client.verify_device(device)
+                            logger.debug(
+                                f"Auto-trusted device {device.device_id} "
+                                f"for {user_id}"
+                            )
+        except Exception as e:
+            logger.debug(f"Auto-trust sweep error (non-fatal): {e}")
+
     # =========================================================================
     # AUTHENTICATION METHODS
     # =========================================================================
@@ -408,6 +473,9 @@ class TextRPChatbot:
                 
                 # Store token in a safe place for backup
                 self._backup_token = self.access_token
+                
+                # Upload Olm identity keys and one-time keys for E2EE
+                await self._upload_keys_if_needed()
                 
                 return True
                 
@@ -1637,43 +1705,18 @@ class TextRPChatbot:
     async def send_encrypted_message(self, room_id: str, message: str) -> Optional[str]:
         """
         Send an encrypted message to a room.
-        
+
+        With encryption_enabled=True, nio's room_send() auto-encrypts when the
+        room has encryption enabled, so this simply delegates to send_message().
+
         Args:
             room_id: The ID of the room
             message: The message to send
-            
+
         Returns:
             The event ID of the sent message, or None if failed
         """
-        logger.info(f"Sending encrypted message to {room_id}")
-        
-        try:
-            # Check if the room is encrypted
-            room = self.client.rooms.get(room_id)
-            if not room or not room.encrypted:
-                logger.warning(f"Room {room_id} is not encrypted, sending as plain text")
-                return await self.send_message(room_id, message)
-            
-            # Send encrypted message
-            response = await self.client.room_send(
-                room_id=room_id,
-                message_type="m.room.encrypted",
-                content={
-                    "msgtype": "m.text",
-                    "body": message
-                }
-            )
-            
-            if isinstance(response, RoomSendError):
-                logger.error(f"Failed to send encrypted message: {response.message}")
-                return None
-            
-            logger.info(f"Encrypted message sent successfully")
-            return response.event_id
-            
-        except Exception as e:
-            logger.error(f"Error sending encrypted message: {e}")
-            return None
+        return await self.send_message(room_id, message)
     
     async def trust_device(self, user_id: str, device_id: str) -> bool:
         """
@@ -1922,6 +1965,10 @@ class TextRPChatbot:
                 if room:
                     for event in room_info.timeline.events:
                         await self._process_event(room, event)
+            
+            # E2EE maintenance: replenish one-time keys and auto-trust devices
+            await self._upload_keys_if_needed()
+            await self._auto_trust_room_devices()
             
             return True
         except Exception as e:
