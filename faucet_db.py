@@ -93,6 +93,42 @@ class FaucetDB:
                 )
             """)
             
+            # Create room_joins table to track welcome messages
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS room_joins (
+                    room_id TEXT PRIMARY KEY,
+                    joined_at DATETIME NOT NULL,
+                    welcome_sent BOOLEAN DEFAULT FALSE,
+                    room_name TEXT
+                )
+            """)
+            
+            # Create user_preferences table for notification settings
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_preferences (
+                    wallet TEXT PRIMARY KEY,
+                    reminders_enabled BOOLEAN DEFAULT TRUE,
+                    reminder_offset INTEGER DEFAULT 1,
+                    timezone TEXT DEFAULT 'UTC',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create scheduled_reminders table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS scheduled_reminders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    wallet TEXT NOT NULL,
+                    room_id TEXT NOT NULL,
+                    reminder_time DATETIME NOT NULL,
+                    message TEXT NOT NULL,
+                    sent BOOLEAN DEFAULT FALSE,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (wallet) REFERENCES claims(wallet)
+                )
+            """)
+            
             # Initialize stats if not exists
             cursor.execute("""
                 INSERT OR IGNORE INTO faucet_stats (id, total_claims, total_distributed, unique_wallets)
@@ -102,6 +138,9 @@ class FaucetDB:
             # Create indexes for performance
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_claims_last_claim ON claims(last_claim)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_blacklist_wallet ON blacklist(wallet)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_room_joins_joined_at ON room_joins(joined_at)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scheduled_reminders_time ON scheduled_reminders(reminder_time)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_scheduled_reminders_wallet ON scheduled_reminders(wallet)")
             
             conn.commit()
             logger.debug("Database tables initialized")
@@ -397,6 +436,335 @@ class FaucetDB:
             except Exception as e:
                 logger.error(f"Error getting blacklist: {e}")
                 return []
+    
+    async def get_user_claim_history(self, wallet: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        Get claim history for a specific wallet.
+        
+        Args:
+            wallet: The XRPL wallet address
+            limit: Maximum number of claims to return
+            
+        Returns:
+            List of claim records
+        """
+        async with self._lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT last_claim, claim_count, total_claimed, last_tx_hash, first_claim
+                        FROM claims 
+                        WHERE wallet = ?
+                        ORDER BY last_claim DESC
+                        LIMIT ?
+                    """, (wallet, limit))
+                    
+                    result = cursor.fetchone()
+                    if result:
+                        return [{
+                            "last_claim": result[0],
+                            "claim_count": result[1],
+                            "total_claimed": result[2],
+                            "last_tx_hash": result[3],
+                            "first_claim": result[4]
+                        }]
+                    return []
+                    
+            except Exception as e:
+                logger.error(f"Error getting claim history for {wallet}: {e}")
+                return []
+    
+    async def record_room_join(self, room_id: str, room_name: str = None) -> bool:
+        """
+        Record when the bot joins a room.
+        
+        Args:
+            room_id: The Matrix room ID
+            room_name: Optional room display name
+            
+        Returns:
+            bool: True if successfully recorded
+        """
+        async with self._lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    now = datetime.now()
+                    
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO room_joins (room_id, joined_at, welcome_sent, room_name)
+                        VALUES (?, ?, FALSE, ?)
+                    """, (room_id, now.isoformat(), room_name))
+                    
+                    conn.commit()
+                    logger.info(f"Recorded room join: {room_id} ({room_name or 'unnamed'})")
+                    return True
+                    
+            except Exception as e:
+                logger.error(f"Error recording room join for {room_id}: {e}")
+                return False
+    
+    async def mark_welcome_sent(self, room_id: str) -> bool:
+        """
+        Mark that welcome message was sent to a room.
+        
+        Args:
+            room_id: The Matrix room ID
+            
+        Returns:
+            bool: True if successfully updated
+        """
+        async with self._lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    
+                    cursor.execute("""
+                        UPDATE room_joins 
+                        SET welcome_sent = TRUE 
+                        WHERE room_id = ?
+                    """, (room_id,))
+                    
+                    conn.commit()
+                    return True
+                    
+            except Exception as e:
+                logger.error(f"Error marking welcome sent for {room_id}: {e}")
+                return False
+    
+    async def get_rooms_needing_welcome(self) -> List[Dict[str, Any]]:
+        """
+        Get rooms that haven't received a welcome message yet.
+        
+        Returns:
+            List of rooms needing welcome
+        """
+        async with self._lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT room_id, joined_at, room_name
+                        FROM room_joins
+                        WHERE welcome_sent = FALSE
+                        ORDER BY joined_at ASC
+                    """)
+                    
+                    return [
+                        {
+                            "room_id": row[0],
+                            "joined_at": row[1],
+                            "room_name": row[2]
+                        }
+                        for row in cursor.fetchall()
+                    ]
+                    
+            except Exception as e:
+                logger.error(f"Error getting rooms needing welcome: {e}")
+                return []
+    
+    async def get_user_preferences(self, wallet: str) -> Optional[Dict[str, Any]]:
+        """
+        Get user notification preferences.
+        
+        Args:
+            wallet: The XRPL wallet address
+            
+        Returns:
+            Dict with preferences or None if not found
+        """
+        async with self._lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT reminders_enabled, reminder_offset, timezone, created_at, updated_at
+                        FROM user_preferences
+                        WHERE wallet = ?
+                    """, (wallet,))
+                    
+                    result = cursor.fetchone()
+                    if result:
+                        return {
+                            "reminders_enabled": bool(result[0]),
+                            "reminder_offset": result[1],
+                            "timezone": result[2],
+                            "created_at": result[3],
+                            "updated_at": result[4]
+                        }
+                    return None
+                    
+            except Exception as e:
+                logger.error(f"Error getting user preferences for {wallet}: {e}")
+                return None
+    
+    async def set_user_preferences(self, wallet: str, preferences: Dict[str, Any]) -> bool:
+        """
+        Update user notification preferences.
+        
+        Args:
+            wallet: The XRPL wallet address
+            preferences: Dict with preference updates
+            
+        Returns:
+            bool: True if successfully updated
+        """
+        async with self._lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    now = datetime.now()
+                    
+                    # Check if user exists
+                    cursor.execute("SELECT wallet FROM user_preferences WHERE wallet = ?", (wallet,))
+                    exists = cursor.fetchone()
+                    
+                    if exists:
+                        # Update existing
+                        set_clause = []
+                        values = []
+                        
+                        if "reminders_enabled" in preferences:
+                            set_clause.append("reminders_enabled = ?")
+                            values.append(int(preferences["reminders_enabled"]))
+                        if "reminder_offset" in preferences:
+                            set_clause.append("reminder_offset = ?")
+                            values.append(preferences["reminder_offset"])
+                        if "timezone" in preferences:
+                            set_clause.append("timezone = ?")
+                            values.append(preferences["timezone"])
+                        
+                        set_clause.append("updated_at = ?")
+                        values.append(now.isoformat())
+                        values.append(wallet)
+                        
+                        cursor.execute(f"""
+                            UPDATE user_preferences 
+                            SET {', '.join(set_clause)}
+                            WHERE wallet = ?
+                        """, values)
+                    else:
+                        # Insert new
+                        cursor.execute("""
+                            INSERT INTO user_preferences (wallet, reminders_enabled, reminder_offset, timezone, created_at, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, (
+                            wallet,
+                            int(preferences.get("reminders_enabled", True)),
+                            preferences.get("reminder_offset", 1),
+                            preferences.get("timezone", "UTC"),
+                            now.isoformat(),
+                            now.isoformat()
+                        ))
+                    
+                    conn.commit()
+                    logger.info(f"Updated preferences for {wallet}")
+                    return True
+                    
+            except Exception as e:
+                logger.error(f"Error setting user preferences for {wallet}: {e}")
+                return False
+    
+    async def schedule_reminder(self, wallet: str, room_id: str, reminder_time: datetime, message: str) -> bool:
+        """
+        Schedule a reminder for a user.
+        
+        Args:
+            wallet: The XRPL wallet address
+            room_id: The Matrix room ID to send reminder to
+            reminder_time: When to send the reminder
+            message: The reminder message
+            
+        Returns:
+            bool: True if successfully scheduled
+        """
+        async with self._lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    
+                    cursor.execute("""
+                        INSERT INTO scheduled_reminders (wallet, room_id, reminder_time, message)
+                        VALUES (?, ?, ?, ?)
+                    """, (wallet, room_id, reminder_time.isoformat(), message))
+                    
+                    conn.commit()
+                    logger.info(f"Scheduled reminder for {wallet} at {reminder_time}")
+                    return True
+                    
+            except Exception as e:
+                logger.error(f"Error scheduling reminder for {wallet}: {e}")
+                return False
+    
+    async def get_pending_reminders(self, before_time: datetime = None) -> List[Dict[str, Any]]:
+        """
+        Get reminders that need to be sent.
+        
+        Args:
+            before_time: Get reminders before this time (default: now)
+            
+        Returns:
+            List of pending reminders
+        """
+        async with self._lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    
+                    if before_time is None:
+                        before_time = datetime.now()
+                    
+                    cursor.execute("""
+                        SELECT id, wallet, room_id, reminder_time, message
+                        FROM scheduled_reminders
+                        WHERE sent = FALSE AND reminder_time <= ?
+                        ORDER BY reminder_time ASC
+                    """, (before_time.isoformat(),))
+                    
+                    reminders = []
+                    for row in cursor.fetchall():
+                        reminders.append({
+                            "id": row[0],
+                            "wallet": row[1],
+                            "room_id": row[2],
+                            "reminder_time": row[3],
+                            "message": row[4]
+                        })
+                    
+                    return reminders
+                    
+            except Exception as e:
+                logger.error(f"Error getting pending reminders: {e}")
+                return []
+    
+    async def mark_reminder_sent(self, reminder_id: int) -> bool:
+        """
+        Mark a reminder as sent.
+        
+        Args:
+            reminder_id: The reminder ID
+            
+        Returns:
+            bool: True if successfully updated
+        """
+        async with self._lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    cursor = conn.cursor()
+                    
+                    cursor.execute("""
+                        UPDATE scheduled_reminders 
+                        SET sent = TRUE 
+                        WHERE id = ?
+                    """, (reminder_id,))
+                    
+                    conn.commit()
+                    return True
+                    
+            except Exception as e:
+                logger.error(f"Error marking reminder {reminder_id} as sent: {e}")
+                return False
     
     async def get_recent_claims(self, limit: int = 10) -> List[Dict[str, Any]]:
         """

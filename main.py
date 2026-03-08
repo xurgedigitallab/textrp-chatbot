@@ -29,6 +29,7 @@ import logging
 import os
 import signal
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -232,7 +233,7 @@ class TextRPBot:
         
         @self.textrp.on_event(InviteMemberEvent)
         async def on_invite(room, event):
-            """Auto-accept room invites."""
+            """Auto-accept room invites and send welcome message."""
             logger.info(f"Received invite event: {event}")
             logger.info(f"Room ID: {room.room_id if room else 'No room'}")
             logger.info(f"State key: {event.state_key}")
@@ -242,6 +243,40 @@ class TextRPBot:
                 logger.info(f"Accepting invite to room: {room.room_id}")
                 await self.textrp.join_room(room.room_id)
                 logger.info(f"Joined room: {room.room_id}")
+                
+                # Record the room join
+                await self.faucet_db.record_room_join(room.room_id, room.display_name)
+                
+                # Send welcome message
+                welcome_msg = f"""👋 **Welcome to TextRP Bot!**
+━━━━━━━━━━━━━━━━━━━━━
+
+I'm your friendly XRPL faucet bot! Here's what I can do:
+
+💧 **Faucet Commands:**
+• `{self.config.command_prefix}faucet` - Claim daily {self.config.faucet_currency_code} tokens
+• `{self.config.command_prefix}trust` - Check trust line status
+• `{self.config.command_prefix}trustdebug` - Debug trust line issues
+• `{self.config.command_prefix}lp` - Check NFT multiplier
+
+💰 **Wallet Commands:**
+• `{self.config.command_prefix}balance` - Check XRP balance
+• `{self.config.command_prefix}tokens` - Show token holdings
+• `{self.config.command_prefix}history` - View your claim history
+
+ℹ️ **Other Commands:**
+• `{self.config.command_prefix}help` - Show all commands
+• `{self.config.command_prefix}whoami` - Show your wallet info
+
+🔔 **Important:** To receive {self.config.faucet_currency_code} tokens, you need a trust line!
+Use `{self.config.command_prefix}trust` to check your status.
+
+Type `{self.config.command_prefix}help` to see all available commands!
+
+*Note: Your TextRP username is your XRPL wallet address*"""
+                
+                await self.textrp.send_message(room.room_id, welcome_msg)
+                await self.faucet_db.mark_welcome_sent(room.room_id)
     
     def _register_commands(self) -> None:
         """Register bot command handlers."""
@@ -266,10 +301,24 @@ class TextRPBot:
 • `{self.config.command_prefix}trust` - Check if you have trust line for TXT
 • `{self.config.command_prefix}trustdebug` - Debug trust line issues (detailed info)
 • `{self.config.command_prefix}lp` - Show LP NFT collection status and multiplier
+• `{self.config.command_prefix}history` - View your claim history
+• `{self.config.command_prefix}reminders` - Manage faucet reminders
+
+🎫 **NFT Multipliers:**
+• Hold LP NFTs to multiply your faucet rewards!
+• 1 NFT = 1.5× multiplier
+• 2+ NFTs = Up to 2×, 3×, or more!
+• Purchase at: https://txt.textrp.io
+
+🌱 **Earn More TXT:**
+• Yield farm your TXT for daily rewards!
+• Visit: https://opulfi.opulencex.io/opulfarming/txtxrp
+• Put your TXT to work and earn passive income
 
 **XRPL / Wallet:**
 • `{self.config.command_prefix}balance` - Check your XRP balance
 • `{self.config.command_prefix}tokens` - Show your token balances
+• `{self.config.command_prefix}history` - View your claim history
 
 **Examples:**
 • `{self.config.command_prefix}balance`
@@ -277,6 +326,8 @@ class TextRPBot:
 • `{self.config.command_prefix}lp`
 • `{self.config.command_prefix}faucet`
 • `{self.config.command_prefix}tokens`
+• `{self.config.command_prefix}history`
+• `{self.config.command_prefix}reminders on`
 """
             await self.textrp.send_message(room.room_id, help_text)
         
@@ -475,12 +526,14 @@ class TextRPBot:
                     )
                 else:
                     balance = self.xrpl.drops_to_xrp(account_info.get("Balance", "0"))
-                    await self.textrp.send_message(
-                        room.room_id,
-                        f"💰 **Balance:** {balance:,.6f} XRP\n"
-                        f"Address: `{address}`\n"
-                        f"Sequence: {account_info.get('Sequence', 'N/A')}"
-                    )
+                    response_msg = f"💰 **Balance:** {balance:,.6f} XRP\n"
+                    response_msg += f"Address: `{address}`\n"
+                    response_msg += f"Sequence: {account_info.get('Sequence', 'N/A')}"
+                    
+                    await self.textrp.send_message(room.room_id, response_msg)
+                    
+                    # Check for NFTs and promote if user has none
+                    await self.check_and_promote_nfts(address, room.room_id)
             except Exception as e:
                 logger.error(f"Error fetching balance: {e}")
                 await self.textrp.send_message(
@@ -577,6 +630,9 @@ class TextRPBot:
                     
                     await self.textrp.send_message(room.room_id, msg)
                     
+                    # Check for NFTs and promote if user has none
+                    await self.check_and_promote_nfts(address, room.room_id)
+                    
             except Exception as e:
                 logger.error(f"Error fetching tokens: {e}")
                 await self.textrp.send_message(
@@ -651,10 +707,63 @@ Use the link above to create your trust line."""
                     )
                     return
                 
+                # Check for NFT multipliers and promote if user has none
+                has_nfts = await self.check_and_promote_nfts(user_wallet, room.room_id)
+                
                 # Check for NFT multipliers
                 base_amount = int(self.config.faucet_daily_amount)
                 multiplier = 1.0
                 nft_count = 0
+                
+                # Only calculate actual multiplier if user has NFTs
+                if has_nfts:
+                    lp_info_raw = os.getenv("LP_INFO", "").strip()
+                    if lp_info_raw:
+                        # Parse LP_INFO (same logic as in lp command)
+                        configured: list[tuple[str, int]] = []
+                        for entry in [e.strip() for e in lp_info_raw.split(",") if e.strip()]:
+                            if ":" in entry:
+                                issuer, taxon_str = [p.strip() for p in entry.split(":", 1)]
+                                try:
+                                    taxon = int(taxon_str)
+                                    if self.xrpl.is_valid_address(issuer):
+                                        configured.append((issuer, taxon))
+                                except ValueError:
+                                    continue
+                        
+                        if configured:
+                            # Get user's NFTs
+                            nfts = await self.xrpl.get_account_nfts(user_wallet)
+                            if nfts:
+                                owned_pairs: set[tuple[str, int]] = set()
+                                for nft in nfts:
+                                    nft_issuer = nft.get("Issuer") or nft.get("issuer")
+                                    nft_taxon_raw = nft.get("NFTokenTaxon") if "NFTokenTaxon" in nft else nft.get("nft_taxon")
+                                    if nft_issuer and nft_taxon_raw is not None:
+                                        try:
+                                            nft_taxon = int(nft_taxon_raw)
+                                            owned_pairs.add((str(nft_issuer), nft_taxon))
+                                        except (TypeError, ValueError):
+                                            continue
+                                
+                                configured_set = set(configured)
+                                matched = configured_set.intersection(owned_pairs)
+                                nft_count = len(matched)
+                                
+                                if nft_count <= 0:
+                                    multiplier = 1.0
+                                elif nft_count == 1:
+                                    multiplier = 1.5
+                                else:
+                                    multiplier = float(nft_count)
+                
+                # Schedule reminder for next claim if user has preferences
+                user_prefs = await self.faucet_db.get_user_preferences(user_wallet)
+                if user_prefs and user_prefs.get("reminders_enabled", True):
+                    reminder_offset = user_prefs.get("reminder_offset", 1)
+                    reminder_time = datetime.now() + timedelta(hours=self.config.faucet_cooldown_hours - reminder_offset)
+                    reminder_msg = f"⏰ Reminder: Your {self.config.faucet_currency_code} faucet claim will be available soon! Use `{self.config.command_prefix}faucet` to claim."
+                    await self.faucet_db.schedule_reminder(user_wallet, room.room_id, reminder_time, reminder_msg)
                 
                 # Send the payment
                 result = await self.xrpl.send_payment(
@@ -742,6 +851,9 @@ Come back in {self.config.faucet_cooldown_hours} hours for your next claim!"""
 
 You can receive {currency} tokens!"""
                     )
+                    
+                    # Check for NFTs and promote if user has none
+                    await self.check_and_promote_nfts(user_wallet, room.room_id)
                 else:
                     await self.textrp.send_message(
                         room.room_id,
@@ -991,8 +1103,222 @@ Please create a trust line to receive tokens."""
             finally:
                 await self.textrp.send_typing(room.room_id, False)
         
+        @self.textrp.on_command("history")
+        async def cmd_history(room, event, args):
+            """Show your faucet claim history."""
+            user_wallet = self.textrp.get_user_wallet_address(event.sender)
+            
+            if not user_wallet:
+                await self.textrp.send_message(
+                    room.room_id,
+                    "❌ Could not extract your wallet address."
+                )
+                return
+            
+            await self.textrp.send_typing(room.room_id, True)
+            
+            try:
+                history = await self.faucet_db.get_user_claim_history(user_wallet)
+                
+                if not history:
+                    await self.textrp.send_message(
+                        room.room_id,
+                        "📭 No claim history found. Use `!faucet` to make your first claim!"
+                    )
+                else:
+                    record = history[0]
+                    last_claim = datetime.fromisoformat(record["last_claim"])
+                    first_claim = datetime.fromisoformat(record["first_claim"])
+                    
+                    # Check if can claim
+                    eligible, reason = await self.faucet_db.check_claim_eligibility(user_wallet)
+                    
+                    msg = f"""📊 **Your Claim History**
+━━━━━━━━━━━━━━━━━━━━━
+
+**Total Claims:** {record['claim_count']}
+**Total Claimed:** {float(record['total_claimed']):,.2f} {self.config.faucet_currency_code}
+**First Claim:** {first_claim.strftime('%Y-%m-%d %H:%M UTC')}
+**Last Claim:** {last_claim.strftime('%Y-%m-%d %H:%M UTC')}
+
+**Status:** {'✅ Ready to claim!' if eligible else f'⏳ {reason}'}
+
+**Last Transaction:**
+`{record['last_tx_hash'][:12]}...{record['last_tx_hash'][-8:]}`"""
+                    
+                    await self.textrp.send_message(room.room_id, msg)
+                    
+            except Exception as e:
+                logger.error(f"Error in history command: {e}")
+                await self.textrp.send_message(
+                    room.room_id,
+                    "❌ Error fetching claim history. Please try again later."
+                )
+            finally:
+                await self.textrp.send_typing(room.room_id, False)
+        
+        @self.textrp.on_command("reminders")
+        async def cmd_reminders(room, event, args):
+            """Manage your reminder preferences."""
+            user_wallet = self.textrp.get_user_wallet_address(event.sender)
+            
+            if not user_wallet:
+                await self.textrp.send_message(
+                    room.room_id,
+                    "❌ Could not extract your wallet address."
+                )
+                return
+            
+            await self.textrp.send_typing(room.room_id, True)
+            
+            try:
+                # Parse arguments
+                args = args.strip().lower()
+                
+                if not args or args == "status":
+                    # Show current preferences
+                    prefs = await self.faucet_db.get_user_preferences(user_wallet)
+                    
+                    if prefs:
+                        msg = f"""🔔 **Reminder Settings**
+━━━━━━━━━━━━━━━━━━━━━
+
+**Reminders:** {'✅ Enabled' if prefs['reminders_enabled'] else '❌ Disabled'}
+**Notify Before:** {prefs['reminder_offset']} hour(s)
+**Timezone:** {prefs['timezone']}
+
+**Commands:**
+• `{self.config.command_prefix}reminders on` - Enable reminders
+• `{self.config.command_prefix}reminders off` - Disable reminders
+• `{self.config.command_prefix}reminders set <hours>` - Set notification offset"""
+                    else:
+                        msg = f"""🔔 **Reminder Settings**
+━━━━━━━━━━━━━━━━━━━━━
+
+Reminders are **enabled** by settings.
+
+You'll be notified 1 hour before your faucet claim is available.
+
+**Commands:**
+• `{self.config.command_prefix}reminders on` - Enable reminders
+• `{self.config.command_prefix}reminders off` - Disable reminders
+• `{self.config.command_prefix}reminders set <hours>` - Set notification offset"""
+                
+                elif args == "on":
+                    await self.faucet_db.set_user_preferences(user_wallet, {"reminders_enabled": True})
+                    msg = "✅ Reminders enabled! You'll be notified before your next claim is available."
+                    
+                elif args == "off":
+                    await self.faucet_db.set_user_preferences(user_wallet, {"reminders_enabled": False})
+                    msg = "❌ Reminders disabled. You won't receive faucet notifications."
+                    
+                elif args.startswith("set "):
+                    try:
+                        hours = int(args.split()[1])
+                        if 0 <= hours <= 24:
+                            await self.faucet_db.set_user_preferences(user_wallet, {"reminder_offset": hours})
+                            msg = f"✅ Reminder offset set to {hours} hour(s) before claim availability."
+                        else:
+                            msg = "❌ Offset must be between 0 and 24 hours."
+                    except (IndexError, ValueError):
+                        msg = f"Usage: `{self.config.command_prefix}reminders set <hours>` (0-24)"
+                else:
+                    msg = f"Usage: `{self.config.command_prefix}reminders [on|off|set <hours>]`"
+                
+                await self.textrp.send_message(room.room_id, msg)
+                
+            except Exception as e:
+                logger.error(f"Error in reminders command: {e}")
+                await self.textrp.send_message(
+                    room.room_id,
+                    "❌ Error managing reminder settings. Please try again later."
+                )
+            finally:
+                await self.textrp.send_typing(room.room_id, False)
                 
             
+    async def check_and_promote_nfts(self, user_wallet: str, room_id: str) -> bool:
+        """
+        Check if user has multiplier NFTs and promote purchase if not.
+        
+        Args:
+            user_wallet: The user's XRP wallet address
+            room_id: The room ID to send promotion message to
+            
+        Returns:
+            bool: True if user has NFTs, False otherwise
+        """
+        try:
+            # Get LP_INFO from environment
+            lp_info_raw = os.getenv("LP_INFO", "").strip()
+            
+            if not lp_info_raw:
+                # LP_INFO not configured, can't check NFTs
+                return True
+            
+            # Parse LP_INFO
+            configured: list[tuple[str, int]] = []
+            for entry in [e.strip() for e in lp_info_raw.split(",") if e.strip()]:
+                if ":" in entry:
+                    issuer, taxon_str = [p.strip() for p in entry.split(":", 1)]
+                    try:
+                        taxon = int(taxon_str)
+                        if self.xrpl.is_valid_address(issuer):
+                            configured.append((issuer, taxon))
+                    except ValueError:
+                        continue
+            
+            if not configured:
+                # No valid LP NFTs configured
+                return True
+            
+            # Get user's NFTs
+            nfts = await self.xrpl.get_account_nfts(user_wallet)
+            if nfts is None:
+                # Could not fetch NFTs, don't promote
+                return True
+            
+            # Check for matching NFTs
+            owned_pairs: set[tuple[str, int]] = set()
+            for nft in nfts:
+                nft_issuer = nft.get("Issuer") or nft.get("issuer")
+                nft_taxon_raw = nft.get("NFTokenTaxon") if "NFTokenTaxon" in nft else nft.get("nft_taxon")
+                if nft_issuer and nft_taxon_raw is not None:
+                    try:
+                        nft_taxon = int(nft_taxon_raw)
+                        owned_pairs.add((str(nft_issuer), nft_taxon))
+                    except (TypeError, ValueError):
+                        continue
+            
+            configured_set = set(configured)
+            matched = configured_set.intersection(owned_pairs)
+            
+            if len(matched) == 0:
+                # User has no multiplier NFTs, send promotion
+                promo_msg = f"""🎫 **Multiply Your Faucet Rewards!**
+━━━━━━━━━━━━━━━━━━━━━
+
+Did you know you can multiply your {self.config.faucet_currency_code} faucet claims?
+
+🚀 **Get Multiplier NFTs to increase your rewards:**
+• 1 NFT = 1.5× multiplier
+• 2+ NFTs = Up to 2×, 3×, or more!
+
+🛒 **Purchase NFTs at:** https://txt.textrp.io
+
+Each NFT you hold increases your daily faucet bonus. Don't miss out on extra tokens!"""
+                
+                await self.textrp.send_message(room_id, promo_msg)
+                return False
+            else:
+                # User has NFTs
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error checking NFTs for promotion: {e}")
+            # On error, don't promote
+            return True
+
     async def start(self) -> None:
         """
         Start the bot and begin processing events.
@@ -1021,12 +1347,20 @@ Please create a trust line to receive tokens."""
         # Start sync loop with shutdown handling
         logger.info("Starting sync loop. Press Ctrl+C to exit.")
         
+        # Start reminder task
+        reminder_task = asyncio.create_task(self._reminder_loop())
+        
         try:
             # Run sync loop until shutdown
             await self.textrp.sync_forever(timeout=30000)
         except asyncio.CancelledError:
             logger.info("Sync loop cancelled")
         finally:
+            reminder_task.cancel()
+            try:
+                await reminder_task
+            except asyncio.CancelledError:
+                pass
             await self.shutdown()
     
     async def shutdown(self) -> None:
@@ -1048,6 +1382,42 @@ Please create a trust line to receive tokens."""
             logger.warning(f"Error closing client: {e}")
         
         logger.info("Shutdown complete")
+    
+    async def _reminder_loop(self) -> None:
+        """Background task to check and send scheduled reminders."""
+        logger.info("Reminder loop started")
+        
+        while not self._shutdown_event.is_set():
+            try:
+                # Get pending reminders
+                reminders = await self.faucet_db.get_pending_reminders()
+                
+                for reminder in reminders:
+                    try:
+                        # Send the reminder
+                        await self.textrp.send_message(
+                            reminder["room_id"],
+                            reminder["message"]
+                        )
+                        
+                        # Mark as sent
+                        await self.faucet_db.mark_reminder_sent(reminder["id"])
+                        logger.info(f"Sent reminder to {reminder['wallet']} in room {reminder['room_id']}")
+                        
+                    except Exception as e:
+                        logger.error(f"Error sending reminder {reminder['id']}: {e}")
+                
+                # Wait 60 seconds before next check
+                await asyncio.sleep(60)
+                
+            except asyncio.CancelledError:
+                logger.info("Reminder loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in reminder loop: {e}")
+                await asyncio.sleep(60)
+        
+        logger.info("Reminder loop stopped")
 
 
 # =============================================================================
