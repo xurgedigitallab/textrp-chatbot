@@ -245,9 +245,32 @@ class TextRPBot:
         
         @self.textrp.on_event(RoomMemberEvent)
         async def on_member_event(room, event):
-            """Handle room member events."""
-            # This handles general member events
-            pass
+            """Handle room member events — welcome new joiners."""
+            # Only act on join events for users other than the bot
+            if event.membership != "join" or event.prev_membership == "join":
+                return
+            if event.state_key == self.textrp.client.user_id:
+                return
+
+            user_id = event.state_key
+            display_name = event.content.get("displayname") or user_id
+
+            welcome_msg = (
+                f"👋 Welcome, **{display_name}**!\n\n"
+                f"I'm the TextRP faucet bot. "
+                f"Type `{self.config.command_prefix}help` to see what I can do."
+            )
+            # HTML body with a proper Matrix mention / pill
+            html_welcome = (
+                f'👋 Welcome, <a href="https://matrix.to/#/{user_id}">{display_name}</a>!'
+                f"<br/><br/>"
+                f"I'm the TextRP faucet bot. "
+                f"Type <code>{self.config.command_prefix}help</code> to see what I can do."
+            )
+
+            await self.textrp.send_message(
+                room.room_id, welcome_msg, formatted_body=html_welcome
+            )
         
         @self.textrp.on_event(InviteMemberEvent)
         async def on_invite(room, event):
