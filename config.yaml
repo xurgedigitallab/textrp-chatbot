@@ -1,0 +1,33 @@
+# TextRP Chatbot Configuration
+# Copy this file to config_local.yaml and update with your settings
+
+# TextRP Homeserver Configuration
+textrp_connection:
+  homeserver: "https://synapse.textrp.io"  # TextRP homeserver
+  username: "@yourbot:synapse.textrp.io"   # Bot's TextRP ID
+  password: "your_password"          # Bot's password
+  device_name: "TextRP Chatbot"     # Device display name
+  room_id: "!yourroomid:synapse.textrp.io" # Default room to join
+
+# TextRP Configuration
+textrp:
+  server_url: "https://api.textrp.com"  # TextRP API endpoint
+  api_key: "your_textrp_api_key"        # Your TextRP API key
+
+# XRPL Configuration
+xrpl:
+  network: "mainnet"  # Options: mainnet, testnet, devnet
+  rpc_url: "https://xrplcluster.com"  # XRPL RPC endpoint
+
+# Weather API Configuration
+weather:
+  api_key: "your_openweathermap_api_key"  # Get from https://openweathermap.org/api
+  base_url: "https://api.openweathermap.org/data/2.5"
+
+# Bot Configuration
+bot:
+  command_prefix: "!"           # Command prefix for bot commands
+  admin_users:                  # TextRP user IDs of bot administrators
+    - "@admin:synapse.textrp.io"
+  log_level: "INFO"            # Logging level: DEBUG, INFO, WARNING, ERROR
+  max_message_length: 4000     # Maximum message length before truncation

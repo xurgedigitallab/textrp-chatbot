@@ -1,0 +1,2581 @@
+"""
+TextRP Chatbot
+==============
+A comprehensive TextRP protocol chatbot.
+User IDs in this homeserver are XRP wallet addresses.
+
+This module provides:
+- Full TextRP room management capabilities
+- Message handling and event processing
+- Room state management
+- Member management
+- Media handling
+
+Dependencies:
+    pip install matrix-nio aiohttp python-dotenv
+
+Usage:
+    from textrp_chatbot import TextRPChatbot
+    
+    bot = TextRPChatbot(homeserver, username, password)
+    await bot.start()
+"""
+
+import asyncio
+import hashlib
+import logging
+import os
+import html
+import re
+from typing import Optional, List, Dict, Any, Callable, Union
+from datetime import datetime, timezone
+
+from nio import (
+    # Client classes
+    AsyncClient,
+    AsyncClientConfig,
+    
+    # Response classes - using verified matrix-nio exports
+    LoginResponse,
+    LoginError,
+    SyncResponse,
+    SyncError,
+    JoinResponse,
+    JoinError,
+    RoomLeaveResponse,
+    RoomLeaveError,
+    RoomCreateResponse,
+    RoomCreateError,
+    RoomKickResponse,
+    RoomKickError,
+    RoomBanResponse,
+    RoomBanError,
+    RoomUnbanResponse,
+    RoomUnbanError,
+    RoomInviteResponse,
+    RoomInviteError,
+    RoomSendResponse,
+    RoomSendError,
+    RoomGetStateResponse,
+    RoomGetStateError,
+    RoomGetStateEventResponse,
+    RoomGetStateEventError,
+    RoomPutStateResponse,
+    RoomPutStateError,
+    RoomRedactResponse,
+    RoomRedactError,
+    RoomMessagesResponse,
+    RoomMessagesError,
+    RoomMemberEvent,
+    RoomForgetResponse,
+    RoomForgetError,
+    UploadResponse,
+    UploadError,
+    ProfileGetDisplayNameResponse,
+    ProfileGetDisplayNameError,
+    ProfileSetDisplayNameResponse,
+    ProfileSetDisplayNameError,
+    ProfileGetAvatarResponse,
+    ProfileGetAvatarError,
+    ProfileSetAvatarResponse,
+    ProfileSetAvatarError,
+    RoomGetVisibilityResponse,
+    RoomGetVisibilityError,
+    RoomResolveAliasResponse,
+    RoomResolveAliasError,
+    
+    # Generic response for methods without specific response types
+    Response,
+    ErrorResponse,
+    
+    # Event classes
+    RoomMessageText,
+    RoomMessageImage,
+    RoomMessageFile,
+    RoomMessageAudio,
+    RoomMessageVideo,
+    RoomMessageNotice,
+    RoomMessageEmote,
+    RoomEncryptedMedia,
+    RoomMemberEvent,
+    RoomNameEvent,
+    RoomTopicEvent,
+    RoomAvatarEvent,
+    RoomAliasEvent,
+    RoomGuestAccessEvent,
+    RoomHistoryVisibilityEvent,
+    RoomJoinRulesEvent,
+    RoomEncryptionEvent,
+    MegolmEvent,
+    OlmEvent,
+    UnknownEncryptedEvent,
+    Event,
+    
+    # Encryption classes
+    EncryptionError,
+)
+
+from nio.crypto import OlmDevice, TrustState
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Configure logging with detailed formatting
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# Suppress noisy crypto warnings from matrix-nio (we handle them ourselves)
+logging.getLogger("nio.crypto.log").setLevel(logging.ERROR)
+
+
+class TextRPChatbot:
+    """
+    A full-featured TextRP chatbot client.
+    
+    This class wraps the matrix-nio AsyncClient and provides convenient methods
+    for all TextRP room operations. User IDs in TextRP are XRP wallet addresses.
+    
+    Attributes:
+        homeserver (str): The TextRP homeserver URL
+        username (str): The bot's TextRP user ID
+        password (str): The bot's password
+        device_name (str): Display name for this device/session
+        client (AsyncClient): The underlying matrix-nio client
+        
+    Example:
+        >>> bot = TextRPChatbot(
+        ...     homeserver="https://synapse.textrp.io",
+        ...     username="@rBot123:synapse.textrp.io",
+        ...     password="secure_password"
+        ... )
+        >>> await bot.start()
+    """
+    
+    def __init__(
+        self,
+        homeserver: str,
+        username: str,
+        access_token: str = None,
+        device_name: str = "TextRP Bot",
+        device_id: Optional[str] = None,
+        store_path: str = "./textrp_store",
+        invalidate_token_on_shutdown: bool = False,
+        config: Optional[AsyncClientConfig] = None
+    ):
+        """
+        Initialize the Matrix chatbot.
+        
+        Args:
+            homeserver: Matrix homeserver URL (e.g., https://matrix.textrp.io)
+            username: Full Matrix user ID (e.g., @wallet_address:matrix.textrp.io)
+            access_token: Access token for authentication
+            device_name: Human-readable device name for this session
+            device_id: Stable device ID for E2EE key persistence (auto-generated if omitted)
+            store_path: Directory path for storing sync tokens and encryption keys
+            config: Optional AsyncClientConfig for advanced configuration
+        """
+        self.homeserver = homeserver
+        self.username = username
+        self.access_token = access_token
+        self.device_name = device_name
+        self.store_path = store_path
+        self.invalidate_token_on_shutdown = invalidate_token_on_shutdown
+        
+        # Ensure store directory exists for persistent state
+        os.makedirs(store_path, exist_ok=True)
+        
+        # Resolve a stable device_id for E2EE key persistence
+        self.device_id = self._resolve_device_id(device_id)
+        
+        # Default client configuration with encryption support
+        if config is None:
+            client_config = AsyncClientConfig(
+                max_limit_exceeded=0,
+                max_timeouts=0,
+                store_sync_tokens=True,
+                encryption_enabled=True,  # Enable E2EE
+            )
+        else:
+            client_config = config
+        
+        self.client = AsyncClient(
+            homeserver,
+            user=self.username,
+            device_id=self.device_id,
+            store_path=self.store_path,
+            config=client_config,
+        )
+        
+        # For TextRP, we might need to always send the token as a query parameter
+        # Let's patch the client's sync method to add the token
+        original_sync = self.client.sync
+        
+        async def sync_with_token(timeout=30000, since=None, full_state=False):
+            # Always include access_token in the request for TextRP
+            params = {}
+            if self.client.access_token:
+                params['access_token'] = self.client.access_token
+            if since:
+                params['since'] = since
+            if full_state:
+                params['full_state'] = 'true'
+            if timeout:
+                params['timeout'] = str(timeout)
+            
+            # Build the URL with parameters
+            path = f"/_matrix/client/r0/sync"
+            if params:
+                query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+                path = f"{path}?{query_string}"
+            
+            # Make the request
+            response = await self.client.send("GET", path)
+            
+            # Parse and return the response
+            if response.status == 200:
+                from nio import SyncResponse
+                return SyncResponse.from_dict(response.json())
+            else:
+                from nio import SyncError
+                return SyncError(response.json().get('error', 'Unknown error'))
+        
+        # Store the patched method
+        self._sync_with_token = sync_with_token
+        
+        # Event handlers registry - maps event types to callback functions
+        self._event_handlers: Dict[type, List[Callable]] = {}
+        
+        # Command handlers registry - maps command strings to callback functions
+        self._command_handlers: Dict[str, Callable] = {}
+        
+        # Command prefix for bot commands (e.g., "!help", "!balance")
+        self.command_prefix = "!"
+        
+        # Track rooms the bot has joined
+        self.joined_rooms: Dict[str, Any] = {}
+        
+        # Flag to control the sync loop
+        self._running = False
+        
+        # Skip command processing until initial sync completes (avoid replaying old commands)
+        self._initial_sync_done = False
+        
+        # Commands whose output contains personal info and should be sent via DM
+        # when invoked from a group room.  Populated by the caller (e.g. main.py).
+        self.sensitive_commands: set = set()
+
+        # Track room-key requests for undecryptable Megolm events so we can
+        # recover decryption without spamming repeated key requests.
+        self._room_key_request_cache: Dict[str, datetime] = {}
+        self._room_key_request_cooldown_seconds = 300
+        
+        logger.info(f"TextRPChatbot initialized for {username} on {homeserver}")
+    
+    # =========================================================================
+    # DEVICE ID PERSISTENCE
+    # =========================================================================
+
+    def _resolve_device_id(self, provided_id: Optional[str] = None) -> str:
+        """
+        Resolve a stable device_id for E2EE key persistence.
+
+        Priority: provided_id > saved file > auto-generated.
+        The resolved ID is saved to store_path/device_id for future runs.
+        """
+        device_id_file = os.path.join(self.store_path, "device_id")
+
+        if provided_id:
+            resolved = provided_id.strip()
+        elif os.path.isfile(device_id_file):
+            resolved = open(device_id_file).read().strip()
+            logger.info(f"Loaded persisted device_id: {resolved}")
+        else:
+            tag = hashlib.sha256(self.username.encode()).hexdigest()[:8].upper()
+            resolved = f"TXTRP_{tag}"
+            logger.info(f"Generated new device_id: {resolved}")
+
+        # Persist for next run
+        with open(device_id_file, "w") as f:
+            f.write(resolved)
+
+        return resolved
+
+    async def _upload_keys_if_needed(self) -> None:
+        """Upload Olm identity keys and one-time keys to the homeserver if needed."""
+        try:
+            if self.client.should_upload_keys:
+                logger.info("Uploading E2EE device keys to homeserver...")
+                response = await self.client.keys_upload()
+                logger.info(f"Keys upload response: {response}")
+            else:
+                logger.info("E2EE keys already uploaded, no upload needed")
+        except Exception as e:
+            logger.error(f"Failed to upload E2EE keys: {e}")
+
+    async def _auto_trust_room_devices(self) -> None:
+        """Auto-trust all devices for all users in joined encrypted rooms."""
+        try:
+            for room_id, room in self.client.rooms.items():
+                if not room.encrypted:
+                    continue
+                for user_id in room.users:
+                    devices = self.client.device_store.active_user_devices(user_id)
+                    for device in devices:
+                        if device.trust_state == TrustState.unset:
+                            self.client.verify_device(device)
+                            logger.debug(
+                                f"Auto-trusted device {device.device_id} "
+                                f"for {user_id}"
+                            )
+        except Exception as e:
+            logger.debug(f"Auto-trust sweep error (non-fatal): {e}")
+
+    async def _bootstrap_e2ee_sessions(self) -> None:
+        """Proactively set up Olm sessions with all devices in encrypted rooms.
+
+        Called once after the initial sync so the bot can decrypt future
+        Megolm messages without the 'no Olm sessions' failure.
+        """
+        try:
+            # 1. Query device keys for all users in encrypted rooms
+            encrypted_rooms = [
+                r for r in self.client.rooms.values() if r.encrypted
+            ]
+            if not encrypted_rooms:
+                logger.info("No encrypted rooms found — skipping E2EE bootstrap")
+                return
+
+            all_users: set = set()
+            for room in encrypted_rooms:
+                all_users.update(room.users.keys())
+
+            logger.info(
+                "E2EE bootstrap: querying keys for %d user(s) across %d encrypted room(s)",
+                len(all_users),
+                len(encrypted_rooms),
+            )
+            await self.client.keys_query()
+
+            # 2. Claim one-time keys to establish Olm sessions
+            if self.client.should_claim_keys:
+                users_for_claim = self.client.get_users_for_key_claiming()
+                if users_for_claim:
+                    logger.info(
+                        "E2EE bootstrap: claiming one-time keys for %d user(s)",
+                        len(users_for_claim),
+                    )
+                    await self.client.keys_claim(users_for_claim)
+
+            # 3. Auto-trust all devices so we can decrypt their messages
+            await self._auto_trust_room_devices()
+
+            # 4. Upload our own keys if needed
+            await self._upload_keys_if_needed()
+
+            # 5. Share outbound group sessions so other devices discover us
+            for room in encrypted_rooms:
+                try:
+                    await self.client.share_group_session(room.room_id)
+                    logger.info(
+                        "E2EE bootstrap: shared group session for %s (%s)",
+                        room.display_name or room.room_id,
+                        room.room_id,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "E2EE bootstrap: share_group_session for %s: %s",
+                        room.room_id,
+                        e,
+                    )
+
+            logger.info("E2EE bootstrap complete")
+        except Exception as e:
+            logger.warning("E2EE bootstrap error (non-fatal): %s", e)
+
+    async def _request_missing_room_key(self, event: MegolmEvent) -> None:
+        """Request a missing Megolm room key for an undecryptable event."""
+        room_id = getattr(event, "room_id", "") or "unknown_room"
+        session_id = getattr(event, "session_id", "") or "unknown_session"
+        cache_key = f"{room_id}:{session_id}"
+
+        now = datetime.now(timezone.utc)
+        last_requested_at = self._room_key_request_cache.get(cache_key)
+        if last_requested_at:
+            elapsed = (now - last_requested_at).total_seconds()
+            if elapsed < self._room_key_request_cooldown_seconds:
+                logger.debug(
+                    "Skipping room key request for %s (requested %.0fs ago)",
+                    cache_key,
+                    elapsed,
+                )
+                return
+
+        try:
+            if self.client.should_query_keys:
+                await self.client.keys_query()
+
+            if self.client.should_claim_keys:
+                users_for_claim = self.client.get_users_for_key_claiming()
+                if users_for_claim:
+                    await self.client.keys_claim(users_for_claim)
+
+            await self._auto_trust_room_devices()
+            response = await self.client.request_room_key(event)
+
+            if response.__class__.__name__.endswith("Error"):
+                logger.warning(
+                    "Room key request failed for %s (sender=%s): %s",
+                    cache_key,
+                    getattr(event, "sender", "unknown_sender"),
+                    response,
+                )
+            else:
+                logger.info(
+                    "Requested missing room key for %s (sender=%s)",
+                    cache_key,
+                    getattr(event, "sender", "unknown_sender"),
+                )
+        except Exception as e:
+            message = str(e).lower()
+            if (
+                "already requested" in message
+                or "already sent out for this session id" in message
+            ):
+                logger.info("Room key already requested for %s", cache_key)
+            else:
+                logger.warning("Failed to request room key for %s: %s", cache_key, e)
+        finally:
+            self._room_key_request_cache[cache_key] = now
+
+    # =========================================================================
+    # AUTHENTICATION METHODS
+    # =========================================================================
+    
+    async def register_user(self) -> bool:
+        """
+        Register a new user account.
+        
+        This should only be done once when setting up the bot.
+        
+        Returns:
+            bool: True if registration successful, False otherwise
+        """
+        logger.info(f"Attempting to register user {self.username}...")
+        
+        try:
+            # Extract just the localpart (everything between @ and :)
+            localpart = self.username.split('@')[1].split(':')[0]
+            logger.debug(f"Registering with localpart: {localpart}")
+            
+            # Try to register the user - register() doesn't take user parameter
+            # We need to create a new client for registration
+            from nio import AsyncClient, RegisterResponse
+            
+            # Create a temporary client for registration
+            temp_client = AsyncClient(self.client.homeserver)
+            
+            response = await temp_client.register(
+                password=None,  # No password needed for token-based auth
+                device_name=self.device_name
+            )
+            
+            if isinstance(response, RegisterResponse):
+                logger.info(f"User registration successful!")
+                logger.info(f"User ID: {response.user_id}")
+                logger.info(f"Device ID: {response.device_id}")
+                logger.info(f"Access token: {response.access_token[:20]}...")
+                
+                # Update our stored token
+                self.access_token = response.access_token
+                self.client.access_token = response.access_token
+                self._backup_token = response.access_token
+                
+                # Close temp client
+                await temp_client.close()
+                
+                return True
+            else:
+                logger.error(f"Registration failed: {response.message}")
+                await temp_client.close()
+                return False
+                
+        except Exception as e:
+            logger.error(f"Registration error: {e}")
+            return False
+
+    async def create_token_via_login(self) -> bool:
+        """
+        Create a valid access token by logging in with username/password.
+        
+        This is a workaround if TextRP's token generation isn't working.
+        
+        Returns:
+            bool: True if token creation successful, False otherwise
+        """
+        logger.info("Attempting to create token via Matrix login API...")
+        
+        try:
+            import aiohttp
+            
+            # First, try to register if user doesn't exist
+            logger.info("Checking if user exists...")
+            register_url = f"{self.client.homeserver}/_matrix/client/r0/register"
+            localpart = self.username.split('@')[1].split(':')[0]
+            
+            register_data = {
+                "username": localpart,
+                "password": "temp_password_" + str(hash(localpart)),
+                "device_id": self.device_name,
+                "initial_device_display_name": self.device_name
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                # Try to register (will fail if user exists, which is fine)
+                async with session.post(register_url, json=register_data) as resp:
+                    if resp.status == 200:
+                        logger.info("User registered successfully!")
+                        data = await resp.json()
+                        self.access_token = data['access_token']
+                        self.client.access_token = data['access_token']
+                        logger.info(f"New token created: {data['access_token'][:20]}...")
+                        return True
+                    elif resp.status == 400:
+                        error = await resp.json()
+                        if "User ID already taken" in error.get('error', ''):
+                            logger.info("User already exists, attempting to login...")
+                        else:
+                            logger.error(f"Registration failed: {error}")
+                            return False
+                
+                # If user exists, try to login with a password
+                # This requires knowing the password or having set one
+                logger.error("Cannot create token without password.")
+                logger.error("Please ensure the user has a password set, or check TextRP logs for token storage issues.")
+                
+            return False
+            
+        except Exception as e:
+            logger.error(f"Token creation error: {e}")
+            return False
+
+    async def login(self) -> bool:
+        """
+        Authenticate with the Matrix homeserver.
+        
+        For TextRP, uses bearer token authentication. Tokens do not expire
+        based on server configuration (expire_access_token: False).
+        
+        Returns:
+            bool: True if authentication successful, False otherwise
+            
+        Raises:
+            Exception: If authentication fails
+        """
+        logger.info(f"Authenticating as {self.username}...")
+        
+        # TextRP uses bearer token authentication
+        if self.access_token:
+            logger.info("Using bearer token authentication (non-expiring)")
+            
+            # Set the token directly on the client
+            self.client.access_token = self.access_token
+            
+            # Verify token is set
+            logger.debug(f"Token set on client: {self.client.access_token[:20] if self.client.access_token else 'None'}...")
+            
+            # Validate the token by checking who we are
+            logger.info("Validating token with /whoami...")
+            try:
+                whoami = await self.client.whoami()
+                
+                # Check if whoami returned an error
+                if hasattr(whoami, 'message') or str(whoami).startswith('WhoamiError'):
+                    logger.error(f"Authentication failed: {whoami}")
+                    logger.error("This means the token is invalid or has been revoked.")
+                    logger.error("Please log into TextRP and generate a new token.")
+                    return False
+                
+                logger.info(f"Authentication successful!")
+                logger.info(f"Authenticated as: {whoami}")
+                logger.info(f"Device ID for E2EE: {self.device_id}")
+                logger.info(f"Set TEXTRP_DEVICE_ID={self.device_id} in your .env for persistent encryption keys")
+                
+                # Store token in a safe place for backup
+                self._backup_token = self.access_token
+                
+                # Load the crypto store (Olm account + sessions) for E2EE
+                try:
+                    self.client.load_store()
+                    logger.info("Crypto store loaded successfully")
+                except Exception as e:
+                    logger.warning(f"Could not load crypto store (E2EE may not work): {e}")
+                
+                # Upload Olm identity keys and one-time keys for E2EE
+                await self._upload_keys_if_needed()
+                
+                return True
+                
+            except Exception as e:
+                logger.error(f"Authentication error: {e}")
+                logger.error("Please ensure you have a valid token from TextRP.")
+                return False
+        else:
+            logger.error("No access token provided for authentication")
+            return False
+    
+    async def logout(self) -> None:
+        """
+        Log out from the Matrix homeserver.
+        
+        Invalidates the current access token and cleans up the session.
+        After logout, the bot must login again to perform any operations.
+        
+        Only logs out if invalidate_token_on_shutdown is True.
+        """
+        if self.invalidate_token_on_shutdown:
+            logger.info("Logging out (token will be invalidated)...")
+            await self.client.logout()
+            logger.info("Logout complete")
+        else:
+            logger.info("Skipping logout (token will remain valid)")
+            # Just close the connection without logging out
+            await self.client.close()
+    
+    async def close(self) -> None:
+        """
+        Close the Matrix client connection.
+        
+        Cleans up resources and closes HTTP connections. Should be called
+        when shutting down the bot.
+        """
+        await self.client.close()
+        logger.info("Client connection closed")
+    
+    # =========================================================================
+    # ROOM CREATION METHODS
+    # =========================================================================
+    
+    async def create_room(
+        self,
+        name: Optional[str] = None,
+        topic: Optional[str] = None,
+        is_direct: bool = False,
+        invite: Optional[List[str]] = None,
+        preset: str = "private_chat",
+        room_alias: Optional[str] = None,
+        visibility: str = "private",
+        initial_state: Optional[List[Dict]] = None,
+        power_level_override: Optional[Dict] = None,
+    ) -> Optional[str]:
+        """
+        Create a new Matrix room with specified settings.
+        
+        Args:
+            name: Human-readable room name
+            topic: Room topic/description
+            is_direct: True for direct message rooms (1:1 chats)
+            invite: List of user IDs to invite (XRP wallet addresses on TextRP)
+            preset: Room preset - "private_chat", "public_chat", or "trusted_private_chat"
+            room_alias: Local part of room alias (e.g., "my-room" -> #my-room:server)
+            visibility: "public" (listed in directory) or "private" (unlisted)
+            initial_state: List of state events to set on room creation
+            power_level_override: Custom power levels for the room
+            
+        Returns:
+            str: The room ID if successful, None otherwise
+            
+        Example:
+            >>> room_id = await bot.create_room(
+            ...     name="XRP Trading Discussion",
+            ...     topic="Discuss XRP trading strategies",
+            ...     invite=["@rWallet123:matrix.textrp.io"]
+            ... )
+        """
+        logger.info(f"Creating room: {name or 'unnamed'}")
+        
+        response = await self.client.room_create(
+            name=name,
+            topic=topic,
+            is_direct=is_direct,
+            invite=invite or [],
+            preset=preset,
+            room_alias_name=room_alias,
+            visibility=visibility,
+            initial_state=initial_state or [],
+            power_level_override=power_level_override,
+        )
+        
+        if isinstance(response, RoomCreateError):
+            logger.error(f"Failed to create room: {response.message}")
+            return None
+        
+        logger.info(f"Room created: {response.room_id}")
+        return response.room_id
+    
+    async def create_direct_message_room(
+        self,
+        user_id: str,
+        name: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Create a direct message (DM) room with another user.
+        
+        On TextRP, the user_id is their XRP wallet address in Matrix format:
+        @<xrp_wallet_address>:matrix.textrp.io
+        
+        Args:
+            user_id: Matrix user ID of the other user (XRP wallet on TextRP)
+            name: Optional name for the DM room
+            
+        Returns:
+            str: The room ID if successful, None otherwise
+        """
+        return await self.create_room(
+            name=name,
+            is_direct=True,
+            invite=[user_id],
+            preset="trusted_private_chat",
+        )
+    
+    def is_group_room(self, room_id: str) -> bool:
+        """
+        Check whether a room is a group chat (more than 2 members).
+        
+        A room with exactly 2 joined members (the bot and one other user)
+        is treated as a DM; anything larger is a group.
+        
+        Args:
+            room_id: The room to check
+            
+        Returns:
+            bool: True if the room has more than 2 members
+        """
+        room = self.client.rooms.get(room_id)
+        if room is None:
+            return False
+        return len(room.users) > 2
+    
+    async def get_or_create_dm(self, user_id: str) -> Optional[str]:
+        """
+        Find an existing DM room with a user, or create one.
+        
+        Searches joined rooms for a 2-member room containing *only* the bot
+        and the target user.  If none exists, creates a new DM room and waits
+        briefly for the sync to register it.
+        
+        Args:
+            user_id: Matrix user ID to DM (e.g. @rWallet:synapse.textrp.io)
+            
+        Returns:
+            str: The DM room ID, or None on failure
+        """
+        # Look for an existing DM room
+        for rid, room in self.client.rooms.items():
+            members = list(room.users.keys())
+            if len(members) == 2 and user_id in members and self.client.user_id in members:
+                logger.info(f"Found existing DM room {rid} with {user_id}")
+                return rid
+        
+        # No existing DM — create one
+        logger.info(f"Creating new DM room with {user_id}")
+        dm_room_id = await self.create_direct_message_room(user_id)
+        if dm_room_id:
+            logger.info(f"Created DM room {dm_room_id} with {user_id}")
+        else:
+            logger.error(f"Failed to create DM room with {user_id}")
+        return dm_room_id
+    
+    # =========================================================================
+    # ROOM JOIN/LEAVE METHODS
+    # =========================================================================
+    
+    async def join_room(self, room_id_or_alias: str) -> Optional[str]:
+        """
+        Join an existing Matrix room.
+        
+        Args:
+            room_id_or_alias: Room ID (!room:server) or alias (#alias:server)
+            
+        Returns:
+            str: The room ID if successful, None otherwise
+        """
+        logger.info(f"Joining room: {room_id_or_alias}")
+        
+        response = await self.client.join(room_id_or_alias)
+        
+        if isinstance(response, JoinError):
+            logger.error(f"Failed to join room: {response.message}")
+            return None
+        
+        logger.info(f"Joined room: {response.room_id}")
+        self.joined_rooms[response.room_id] = True
+        return response.room_id
+    
+    async def leave_room(self, room_id: str) -> bool:
+        """
+        Leave a Matrix room.
+        
+        The bot will no longer receive events from this room. The room
+        history remains accessible unless the room is also forgotten.
+        
+        Args:
+            room_id: The room ID to leave
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        logger.info(f"Leaving room: {room_id}")
+        
+        response = await self.client.room_leave(room_id)
+        
+        if isinstance(response, RoomLeaveError):
+            logger.error(f"Failed to leave room: {response.message}")
+            return False
+        
+        logger.info(f"Left room: {room_id}")
+        self.joined_rooms.pop(room_id, None)
+        return True
+    
+    async def forget_room(self, room_id: str) -> bool:
+        """
+        Forget a room after leaving it.
+        
+        This removes the room from the user's room list entirely.
+        Must have already left the room before forgetting it.
+        
+        Args:
+            room_id: The room ID to forget
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        logger.info(f"Forgetting room: {room_id}")
+        
+        response = await self.client.room_forget(room_id)
+        
+        if isinstance(response, RoomForgetError):
+            logger.error(f"Failed to forget room: {response.message}")
+            return False
+        
+        logger.info(f"Forgot room: {room_id}")
+        return True
+    
+    # =========================================================================
+    # ROOM MEMBER MANAGEMENT METHODS
+    # =========================================================================
+    
+    async def invite_user(self, room_id: str, user_id: str) -> bool:
+        """
+        Invite a user to a room.
+        
+        On TextRP, the user_id is their XRP wallet address in Matrix format.
+        
+        Args:
+            room_id: The room to invite the user to
+            user_id: Matrix user ID to invite (e.g., @rWallet:matrix.textrp.io)
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        logger.info(f"Inviting {user_id} to {room_id}")
+        
+        response = await self.client.room_invite(room_id, user_id)
+        
+        if isinstance(response, RoomInviteError):
+            logger.error(f"Failed to invite user: {response.message}")
+            return False
+        
+        logger.info(f"Invited {user_id} to {room_id}")
+        return True
+    
+    async def kick_user(
+        self,
+        room_id: str,
+        user_id: str,
+        reason: Optional[str] = None
+    ) -> bool:
+        """
+        Kick a user from a room.
+        
+        The user is removed from the room but can rejoin if they have
+        permission. Use ban_user() to prevent rejoining.
+        
+        Args:
+            room_id: The room to kick the user from
+            user_id: Matrix user ID to kick
+            reason: Optional reason for the kick (visible to the user)
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        logger.info(f"Kicking {user_id} from {room_id}: {reason or 'No reason'}")
+        
+        response = await self.client.room_kick(room_id, user_id, reason)
+        
+        if isinstance(response, RoomKickError):
+            logger.error(f"Failed to kick user: {response.message}")
+            return False
+        
+        logger.info(f"Kicked {user_id} from {room_id}")
+        return True
+    
+    async def ban_user(
+        self,
+        room_id: str,
+        user_id: str,
+        reason: Optional[str] = None
+    ) -> bool:
+        """
+        Ban a user from a room.
+        
+        The user is removed and prevented from rejoining until unbanned.
+        
+        Args:
+            room_id: The room to ban the user from
+            user_id: Matrix user ID to ban
+            reason: Optional reason for the ban (visible to room members)
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        logger.info(f"Banning {user_id} from {room_id}: {reason or 'No reason'}")
+        
+        response = await self.client.room_ban(room_id, user_id, reason)
+        
+        if isinstance(response, RoomBanError):
+            logger.error(f"Failed to ban user: {response.message}")
+            return False
+        
+        logger.info(f"Banned {user_id} from {room_id}")
+        return True
+    
+    async def unban_user(self, room_id: str, user_id: str) -> bool:
+        """
+        Unban a previously banned user from a room.
+        
+        The user will be able to rejoin the room (if they are invited
+        or the room is public).
+        
+        Args:
+            room_id: The room to unban the user from
+            user_id: Matrix user ID to unban
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        logger.info(f"Unbanning {user_id} from {room_id}")
+        
+        response = await self.client.room_unban(room_id, user_id)
+        
+        if isinstance(response, RoomUnbanError):
+            logger.error(f"Failed to unban user: {response.message}")
+            return False
+        
+        logger.info(f"Unbanned {user_id} from {room_id}")
+        return True
+    
+    async def get_room_members(self, room_id: str) -> List[str]:
+        """
+        Get a list of all members in a room.
+        
+        Returns user IDs of all joined members. On TextRP, these are
+        XRP wallet addresses in Matrix format.
+        
+        Args:
+            room_id: The room to get members from
+            
+        Returns:
+            List[str]: List of Matrix user IDs
+        """
+        # Access room members from the client's synced room state
+        room = self.client.rooms.get(room_id)
+        if room:
+            return list(room.users.keys())
+        return []
+    
+    async def get_room_member_count(self, room_id: str) -> int:
+        """
+        Get the number of members in a room.
+        
+        Args:
+            room_id: The room to count members in
+            
+        Returns:
+            int: Number of joined members
+        """
+        members = await self.get_room_members(room_id)
+        return len(members)
+    
+    # =========================================================================
+    # MESSAGE SENDING METHODS
+    # =========================================================================
+    
+    async def send_message(
+        self,
+        room_id: str,
+        message: str,
+        msgtype: str = "m.text",
+        formatted_body: Optional[str] = None,
+        reply_to_event_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Send a text message to a room.
+        
+        Args:
+            room_id: The room to send the message to
+            message: The message text content
+            msgtype: Message type - "m.text", "m.notice", "m.emote"
+            formatted_body: Optional HTML-formatted version of the message
+            reply_to_event_id: Optional event ID to reply to (threading)
+            
+        Returns:
+            str: The event ID of the sent message, None on failure
+            
+        Example:
+            >>> event_id = await bot.send_message(
+            ...     room_id="!abc123:matrix.textrp.io",
+            ...     message="Hello, XRP community!"
+            ... )
+        """
+        plain_body = message
+        html_body = formatted_body
+
+        if html_body is None:
+            plain_body, html_body = self._render_message_bodies(message)
+
+        # Message content following Matrix spec
+        content = {
+            "msgtype": msgtype,
+            "body": plain_body,
+        }
+
+        # Add formatted body if provided (HTML formatting)
+        if html_body:
+            content["format"] = "org.matrix.custom.html"
+            content["formatted_body"] = html_body
+
+        # Add reply relation if replying to a message
+        if reply_to_event_id:
+            content["m.relates_to"] = {
+                "m.in_reply_to": {
+                    "event_id": reply_to_event_id
+                }
+            }
+
+        # Check if room is encrypted and prepare encryption if needed
+        room = self.client.rooms.get(room_id)
+        
+        # Safety net: if nio thinks room is unencrypted, verify via server state
+        if room and not room.encrypted:
+            try:
+                state_resp = await self.client.room_get_state_event(
+                    room_id, "m.room.encryption"
+                )
+                logger.info(f"Encryption state check for {room_id}: {type(state_resp).__name__}")
+                if isinstance(state_resp, RoomGetStateEventResponse):
+                    logger.info(f"Room {room_id} has m.room.encryption state but nio missed it — treating as encrypted")
+                    room.encrypted = True
+            except Exception as e:
+                logger.warning(f"Could not check encryption state for {room_id}: {e}")
+        
+        if room and room.encrypted:
+            logger.info(f"Room {room_id} is encrypted, preparing E2EE send...")
+            try:
+                # Ensure we have device keys for all room members
+                user_ids = list(room.users.keys())
+                missing = [
+                    u for u in user_ids
+                    if not self.client.device_store.active_user_devices(u)
+                ]
+                if missing:
+                    logger.info(f"Querying keys for {len(missing)} user(s) in encrypted room")
+                    await self.client.keys_query()
+
+                # Auto-trust any unset devices so encryption can proceed
+                for user_id in user_ids:
+                    for device in self.client.device_store.active_user_devices(user_id):
+                        if device.trust_state == TrustState.unset:
+                            self.client.verify_device(device)
+                            logger.debug(f"Auto-trusted {device.device_id} for {user_id}")
+
+                # Share outbound group session so we can encrypt outgoing messages
+                try:
+                    await self.client.share_group_session(room_id)
+                except Exception as e:
+                    logger.warning(f"share_group_session for {room_id}: {e}")
+            except Exception as e:
+                logger.warning(f"E2EE prep for {room_id} failed (will attempt send anyway): {e}")
+        else:
+            logger.debug(f"Room {room_id} is {'not encrypted' if room else 'unknown (not in room list)'}")
+
+        async def _send():
+            try:
+                response = await self.client.room_send(
+                    room_id=room_id,
+                    message_type="m.room.message",
+                    content=content,
+                )
+            except Exception as e:
+                logger.error(f"Exception during room_send to {room_id}: {type(e).__name__}: {e}", exc_info=True)
+                return None
+
+            if isinstance(response, RoomSendError):
+                logger.error(f"Failed to send message to {room_id}: {response.message}")
+                return None
+
+            logger.info(f"Message sent to {room_id} (event: {response.event_id}): {message[:80]}...")
+            return response.event_id
+
+        return await _send()
+
+    def _render_message_bodies(self, message: str) -> tuple[str, Optional[str]]:
+        plain = self._markdownish_to_plain(message)
+        html_version = self._markdownish_to_html(message)
+        if html_version is None:
+            return message, None
+
+        return plain, html_version
+
+    def _markdownish_to_plain(self, text: str) -> str:
+        if not text:
+            return text
+
+        t = text
+        t = re.sub(r"```[\s\S]*?```", lambda m: m.group(0)[3:-3].strip("\n"), t)
+        t = re.sub(r"`([^`]+)`", r"\1", t)
+        t = re.sub(r"\*\*([^*]+)\*\*", r"\1", t)
+        t = re.sub(r"\*([^*]+)\*", r"\1", t)
+        t = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", t)
+        return t
+
+    def _markdownish_to_html(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+
+        has_markup = any(tok in text for tok in ("```", "`", "**", "["))
+        if not has_markup:
+            return None
+
+        parts: list[str] = []
+        i = 0
+        while True:
+            start = text.find("```", i)
+            if start == -1:
+                parts.append(self._inline_markdownish_to_html(text[i:]))
+                break
+
+            parts.append(self._inline_markdownish_to_html(text[i:start]))
+            end = text.find("```", start + 3)
+            if end == -1:
+                parts.append(self._inline_markdownish_to_html(text[start:]))
+                break
+
+            code = text[start + 3 : end].strip("\n")
+            parts.append(f"<pre><code>{html.escape(code)}</code></pre>")
+            i = end + 3
+
+        html_text = "".join(parts)
+        html_text = html_text.replace("\n", "<br/>")
+        return html_text
+
+    def _inline_markdownish_to_html(self, text: str) -> str:
+        escaped = html.escape(text)
+
+        def _link_sub(m: re.Match) -> str:
+            label = html.escape(m.group(1))
+            url = html.escape(m.group(2), quote=True)
+            return f'<a href="{url}">{label}</a>'
+
+        escaped = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _link_sub, escaped)
+        escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
+        escaped = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", escaped)
+        escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+        return escaped
+    
+    async def send_notice(self, room_id: str, message: str) -> Optional[str]:
+        """
+        Send a notice message to a room.
+        
+        Notices are typically used for bot responses and automated messages.
+        Clients may display notices differently (e.g., dimmed text).
+        
+        Args:
+            room_id: The room to send the notice to
+            message: The notice text content
+            
+        Returns:
+            str: The event ID of the sent notice, None on failure
+        """
+        return await self.send_message(room_id, message, msgtype="m.notice")
+    
+    async def send_emote(self, room_id: str, message: str) -> Optional[str]:
+        """
+        Send an emote message to a room.
+        
+        Emotes are displayed as actions (e.g., "* Bot waves hello").
+        
+        Args:
+            room_id: The room to send the emote to
+            message: The emote text (without the asterisk)
+            
+        Returns:
+            str: The event ID of the sent emote, None on failure
+        """
+        return await self.send_message(room_id, message, msgtype="m.emote")
+    
+    async def send_html_message(
+        self,
+        room_id: str,
+        plain_text: str,
+        html: str
+    ) -> Optional[str]:
+        """
+        Send a message with HTML formatting.
+        
+        The plain_text version is shown on clients that don't support HTML.
+        
+        Args:
+            room_id: The room to send to
+            plain_text: Plain text fallback version
+            html: HTML-formatted version of the message
+            
+        Returns:
+            str: The event ID of the sent message, None on failure
+            
+        Example:
+            >>> await bot.send_html_message(
+            ...     room_id="!abc:server",
+            ...     plain_text="Balance: 100 XRP",
+            ...     html="<b>Balance:</b> <code>100 XRP</code>"
+            ... )
+        """
+        return await self.send_message(
+            room_id,
+            plain_text,
+            formatted_body=html
+        )
+    
+    async def send_reaction(
+        self,
+        room_id: str,
+        event_id: str,
+        reaction: str
+    ) -> Optional[str]:
+        """
+        Send a reaction (emoji) to a message.
+        
+        Args:
+            room_id: The room containing the message
+            event_id: The event ID of the message to react to
+            reaction: The reaction emoji (e.g., "👍", "❤️")
+            
+        Returns:
+            str: The event ID of the reaction, None on failure
+        """
+        content = {
+            "m.relates_to": {
+                "rel_type": "m.annotation",
+                "event_id": event_id,
+                "key": reaction,
+            }
+        }
+        
+        response = await self.client.room_send(
+            room_id=room_id,
+            message_type="m.reaction",
+            content=content,
+        )
+        
+        if isinstance(response, RoomSendError):
+            logger.error(f"Failed to send reaction: {response.message}")
+            return None
+        
+        return response.event_id
+    
+    async def redact_message(
+        self,
+        room_id: str,
+        event_id: str,
+        reason: Optional[str] = None
+    ) -> bool:
+        """
+        Redact (delete) a message from a room.
+        
+        Redacted messages are removed from the visible timeline but
+        the event ID remains in the DAG. Requires appropriate permissions.
+        
+        Args:
+            room_id: The room containing the message
+            event_id: The event ID of the message to redact
+            reason: Optional reason for the redaction
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        logger.info(f"Redacting event {event_id} in {room_id}")
+        
+        response = await self.client.room_redact(room_id, event_id, reason)
+        
+        if isinstance(response, RoomRedactError):
+            logger.error(f"Failed to redact message: {response.message}")
+            return False
+        
+        logger.info(f"Redacted event {event_id}")
+        return True
+    
+    # =========================================================================
+    # TYPING AND READ RECEIPTS
+    # =========================================================================
+    
+    async def send_typing(
+        self,
+        room_id: str,
+        typing: bool = True,
+        timeout: int = 30000
+    ) -> bool:
+        """
+        Send a typing indicator to a room.
+        
+        Shows other users that the bot is "typing". Useful for indicating
+        the bot is processing a request.
+        
+        Args:
+            room_id: The room to send typing indicator to
+            typing: True to start typing, False to stop
+            timeout: How long typing indicator should remain (milliseconds)
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        response = await self.client.room_typing(room_id, typing, timeout)
+        
+        if isinstance(response, ErrorResponse):
+            logger.error(f"Failed to send typing indicator: {response.message}")
+            return False
+        
+        return True
+    
+    async def mark_as_read(
+        self,
+        room_id: str,
+        event_id: str,
+        read_to_event_id: Optional[str] = None
+    ) -> bool:
+        """
+        Mark messages as read up to a specific event.
+        
+        Updates read receipts and the read marker in the room timeline.
+        
+        Args:
+            room_id: The room containing the messages
+            event_id: The event ID to set as fully read marker
+            read_to_event_id: Optional event ID for read receipt (defaults to event_id)
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        response = await self.client.room_read_markers(
+            room_id,
+            fully_read_event=event_id,
+            read_event=read_to_event_id or event_id,
+        )
+        
+        if isinstance(response, ErrorResponse):
+            logger.error(f"Failed to mark as read: {response.message}")
+            return False
+        
+        return True
+    
+    # =========================================================================
+    # ROOM STATE METHODS
+    # =========================================================================
+    
+    async def get_room_state(self, room_id: str) -> Optional[List[Dict]]:
+        """
+        Get all state events for a room.
+        
+        Returns all current state including room name, topic, members,
+        power levels, and other room configuration.
+        
+        Args:
+            room_id: The room to get state from
+            
+        Returns:
+            List[Dict]: List of state events, None on failure
+        """
+        response = await self.client.room_get_state(room_id)
+        
+        if isinstance(response, RoomGetStateError):
+            logger.error(f"Failed to get room state: {response.message}")
+            return None
+        
+        return response.events
+    
+    async def get_room_state_event(
+        self,
+        room_id: str,
+        event_type: str,
+        state_key: str = ""
+    ) -> Optional[Dict]:
+        """
+        Get a specific state event from a room.
+        
+        Args:
+            room_id: The room to get state from
+            event_type: The type of state event (e.g., "m.room.name")
+            state_key: The state key (empty string for room-level state)
+            
+        Returns:
+            Dict: The state event content, None on failure
+            
+        Example:
+            >>> name_event = await bot.get_room_state_event(
+            ...     room_id="!abc:server",
+            ...     event_type="m.room.name"
+            ... )
+            >>> print(name_event.get("name"))
+        """
+        response = await self.client.room_get_state_event(
+            room_id, event_type, state_key
+        )
+        
+        if isinstance(response, RoomGetStateEventError):
+            logger.error(f"Failed to get state event: {response.message}")
+            return None
+        
+        return response.content
+    
+    async def set_room_state(
+        self,
+        room_id: str,
+        event_type: str,
+        content: Dict,
+        state_key: str = ""
+    ) -> Optional[str]:
+        """
+        Set a state event in a room.
+        
+        Used to update room configuration like name, topic, join rules, etc.
+        
+        Args:
+            room_id: The room to update
+            event_type: The type of state event to set
+            content: The content for the state event
+            state_key: The state key (empty string for room-level state)
+            
+        Returns:
+            str: The event ID of the state event, None on failure
+        """
+        response = await self.client.room_put_state(
+            room_id, event_type, content, state_key
+        )
+        
+        if isinstance(response, RoomPutStateError):
+            logger.error(f"Failed to set room state: {response.message}")
+            return None
+        
+        return response.event_id
+    
+    async def set_room_name(self, room_id: str, name: str) -> Optional[str]:
+        """
+        Set the name of a room.
+        
+        Args:
+            room_id: The room to rename
+            name: The new room name
+            
+        Returns:
+            str: The event ID, None on failure
+        """
+        return await self.set_room_state(
+            room_id,
+            "m.room.name",
+            {"name": name}
+        )
+    
+    async def set_room_topic(self, room_id: str, topic: str) -> Optional[str]:
+        """
+        Set the topic of a room.
+        
+        Args:
+            room_id: The room to update
+            topic: The new room topic
+            
+        Returns:
+            str: The event ID, None on failure
+        """
+        return await self.set_room_state(
+            room_id,
+            "m.room.topic",
+            {"topic": topic}
+        )
+    
+    async def set_room_join_rules(
+        self,
+        room_id: str,
+        join_rule: str = "invite"
+    ) -> Optional[str]:
+        """
+        Set the join rules for a room.
+        
+        Args:
+            room_id: The room to update
+            join_rule: "public" (anyone can join), "invite" (invite only),
+                      "knock" (request to join), "restricted" (space members)
+            
+        Returns:
+            str: The event ID, None on failure
+        """
+        return await self.set_room_state(
+            room_id,
+            "m.room.join_rules",
+            {"join_rule": join_rule}
+        )
+    
+    async def set_room_guest_access(
+        self,
+        room_id: str,
+        guest_access: str = "forbidden"
+    ) -> Optional[str]:
+        """
+        Set guest access for a room.
+        
+        Args:
+            room_id: The room to update
+            guest_access: "can_join" or "forbidden"
+            
+        Returns:
+            str: The event ID, None on failure
+        """
+        return await self.set_room_state(
+            room_id,
+            "m.room.guest_access",
+            {"guest_access": guest_access}
+        )
+    
+    async def set_room_history_visibility(
+        self,
+        room_id: str,
+        history_visibility: str = "shared"
+    ) -> Optional[str]:
+        """
+        Set history visibility for a room.
+        
+        Controls who can see message history.
+        
+        Args:
+            room_id: The room to update
+            history_visibility: 
+                - "world_readable": Anyone can read history
+                - "shared": Members can read all history
+                - "invited": Members can read from invite time
+                - "joined": Members can read from join time
+                
+        Returns:
+            str: The event ID, None on failure
+        """
+        return await self.set_room_state(
+            room_id,
+            "m.room.history_visibility",
+            {"history_visibility": history_visibility}
+        )
+    
+    async def get_room_power_levels(self, room_id: str) -> Optional[Dict]:
+        """
+        Get the power levels for a room.
+        
+        Power levels control who can perform various actions in the room.
+        
+        Args:
+            room_id: The room to query
+            
+        Returns:
+            Dict: The power levels configuration, None on failure
+        """
+        return await self.get_room_state_event(room_id, "m.room.power_levels")
+    
+    async def set_user_power_level(
+        self,
+        room_id: str,
+        user_id: str,
+        power_level: int
+    ) -> Optional[str]:
+        """
+        Set a user's power level in a room.
+        
+        Common power levels:
+        - 0: Regular user
+        - 50: Moderator
+        - 100: Admin
+        
+        Args:
+            room_id: The room to update
+            user_id: The user to set power level for
+            power_level: The power level (0-100 typically)
+            
+        Returns:
+            str: The event ID, None on failure
+        """
+        # Get current power levels
+        current = await self.get_room_power_levels(room_id)
+        if current is None:
+            return None
+        
+        # Update the user's power level
+        if "users" not in current:
+            current["users"] = {}
+        current["users"][user_id] = power_level
+        
+        return await self.set_room_state(
+            room_id,
+            "m.room.power_levels",
+            current
+        )
+    
+    # =========================================================================
+    # ROOM INFORMATION METHODS
+    # =========================================================================
+    
+    async def get_room_name(self, room_id: str) -> Optional[str]:
+        """
+        Get the display name of a room.
+        
+        Args:
+            room_id: The room to query
+            
+        Returns:
+            str: The room name, None if not set or on failure
+        """
+        event = await self.get_room_state_event(room_id, "m.room.name")
+        return event.get("name") if event else None
+    
+    async def get_room_topic(self, room_id: str) -> Optional[str]:
+        """
+        Get the topic of a room.
+        
+        Args:
+            room_id: The room to query
+            
+        Returns:
+            str: The room topic, None if not set or on failure
+        """
+        event = await self.get_room_state_event(room_id, "m.room.topic")
+        return event.get("topic") if event else None
+    
+    async def resolve_room_alias(
+        self,
+        room_alias: str
+    ) -> Optional[str]:
+        """
+        Resolve a room alias to a room ID.
+        
+        Args:
+            room_alias: The room alias (e.g., #myroom:server)
+            
+        Returns:
+            str: The room ID, None on failure
+        """
+        response = await self.client.room_resolve_alias(room_alias)
+        
+        if isinstance(response, RoomResolveAliasError):
+            logger.error(f"Failed to resolve alias: {response.message}")
+            return None
+        
+        return response.room_id
+    
+    async def get_room_visibility(self, room_id: str) -> Optional[str]:
+        """
+        Get the visibility of a room in the room directory.
+        
+        Args:
+            room_id: The room to query
+            
+        Returns:
+            str: "public" or "private", None on failure
+        """
+        response = await self.client.room_get_visibility(room_id)
+        
+        if isinstance(response, RoomGetVisibilityError):
+            logger.error(f"Failed to get visibility: {response.message}")
+            return None
+        
+        return response.visibility
+    
+    # =========================================================================
+    # MESSAGE HISTORY METHODS
+    # =========================================================================
+    
+    async def get_room_messages(
+        self,
+        room_id: str,
+        start: Optional[str] = None,
+        limit: int = 10,
+        direction: str = "b"  # "b" for backwards, "f" for forwards
+    ) -> Optional[List[Event]]:
+        """
+        Fetch message history from a room.
+        
+        Args:
+            room_id: The room to fetch messages from
+            start: Pagination token (None for most recent)
+            limit: Maximum number of messages to return
+            direction: "b" for backwards (older), "f" for forwards (newer)
+            
+        Returns:
+            List[Event]: List of message events, None on failure
+        """
+        response = await self.client.room_messages(
+            room_id,
+            start=start or "",
+            limit=limit,
+            direction=direction,
+        )
+        
+        if isinstance(response, RoomMessagesError):
+            logger.error(f"Failed to get room messages: {response.message}")
+            return None
+        
+        return response.chunk
+    
+    # =========================================================================
+    # PROFILE METHODS
+    # =========================================================================
+    
+    async def get_display_name(
+        self,
+        user_id: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Get a user's display name.
+        
+        Args:
+            user_id: The user to query (defaults to bot's own ID)
+            
+        Returns:
+            str: The display name, None on failure
+        """
+        user = user_id or self.username
+        response = await self.client.get_displayname(user)
+        
+        if isinstance(response, ProfileGetDisplayNameError):
+            logger.error(f"Failed to get display name: {response.message}")
+            return None
+        
+        return response.displayname
+    
+    async def set_display_name(self, display_name: str) -> bool:
+        """
+        Set the bot's display name.
+        
+        Args:
+            display_name: The new display name
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        response = await self.client.set_displayname(display_name)
+        
+        if isinstance(response, ProfileSetDisplayNameError):
+            logger.error(f"Failed to set display name: {response.message}")
+            return False
+        
+        logger.info(f"Display name set to: {display_name}")
+        return True
+    
+    async def get_avatar_url(
+        self,
+        user_id: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Get a user's avatar URL.
+        
+        Args:
+            user_id: The user to query (defaults to bot's own ID)
+            
+        Returns:
+            str: The avatar mxc:// URL, None on failure
+        """
+        user = user_id or self.username
+        response = await self.client.get_avatar(user)
+        
+        if isinstance(response, ProfileGetAvatarError):
+            logger.error(f"Failed to get avatar: {response.message}")
+            return None
+        
+        return response.avatar_url
+    
+    async def set_avatar(self, mxc_url: str) -> bool:
+        """
+        Set the bot's avatar.
+        
+        Args:
+            mxc_url: The mxc:// URL of the uploaded avatar image
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        response = await self.client.set_avatar(mxc_url)
+        
+        if isinstance(response, ProfileSetAvatarError):
+            logger.error(f"Failed to set avatar: {response.message}")
+            return False
+        
+        logger.info(f"Avatar set to: {mxc_url}")
+        return True
+    
+    # =========================================================================
+    # MEDIA UPLOAD METHODS
+    # =========================================================================
+    
+    async def upload_file(
+        self,
+        file_path: str,
+        content_type: str = "application/octet-stream",
+        filename: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Upload a file to the Matrix content repository.
+        
+        Args:
+            file_path: Local path to the file to upload
+            content_type: MIME type of the file
+            filename: Optional filename to use (defaults to file's name)
+            
+        Returns:
+            str: The mxc:// URL of the uploaded file, None on failure
+        """
+        import aiofiles
+        
+        if filename is None:
+            filename = os.path.basename(file_path)
+        
+        async with aiofiles.open(file_path, "rb") as f:
+            data = await f.read()
+        
+        response = await self.client.upload(
+            data,
+            content_type=content_type,
+            filename=filename,
+        )
+        
+        if isinstance(response, UploadError):
+            logger.error(f"Failed to upload file: {response.message}")
+            return None
+        
+        logger.info(f"File uploaded: {response.content_uri}")
+        return response.content_uri
+    
+    async def send_image(
+        self,
+        room_id: str,
+        image_path: str,
+        body: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Send an image to a room.
+        
+        Args:
+            room_id: The room to send the image to
+            image_path: Local path to the image file
+            body: Optional alt text for the image
+            
+        Returns:
+            str: The event ID of the sent message, None on failure
+        """
+        import mimetypes
+        
+        # Detect content type
+        content_type, _ = mimetypes.guess_type(image_path)
+        if content_type is None:
+            content_type = "image/png"
+        
+        # Upload the image
+        mxc_url = await self.upload_file(image_path, content_type)
+        if mxc_url is None:
+            return None
+        
+        # Send the image message
+        filename = os.path.basename(image_path)
+        content = {
+            "msgtype": "m.image",
+            "body": body or filename,
+            "url": mxc_url,
+            "info": {
+                "mimetype": content_type,
+            }
+        }
+        
+        response = await self.client.room_send(
+            room_id=room_id,
+            message_type="m.room.message",
+            content=content,
+        )
+        
+        if isinstance(response, RoomSendError):
+            logger.error(f"Failed to send image: {response.message}")
+            return None
+        
+        return response.event_id
+    
+    async def send_file(
+        self,
+        room_id: str,
+        file_path: str,
+        body: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Send a file to a room.
+        
+        Args:
+            room_id: The room to send the file to
+            file_path: Local path to the file
+            body: Optional description for the file
+            
+        Returns:
+            str: The event ID of the sent message, None on failure
+        """
+        import mimetypes
+        
+        # Detect content type
+        content_type, _ = mimetypes.guess_type(file_path)
+        if content_type is None:
+            content_type = "application/octet-stream"
+        
+        # Upload the file
+        mxc_url = await self.upload_file(file_path, content_type)
+        if mxc_url is None:
+            return None
+        
+        # Send the file message
+        filename = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
+        content = {
+            "msgtype": "m.file",
+            "body": body or filename,
+            "url": mxc_url,
+            "filename": filename,
+            "info": {
+                "mimetype": content_type,
+                "size": file_size,
+            }
+        }
+        
+        response = await self.client.room_send(
+            room_id=room_id,
+            message_type="m.room.message",
+            content=content,
+        )
+        
+        if isinstance(response, RoomSendError):
+            logger.error(f"Failed to send file: {response.message}")
+            return None
+        
+        return response.event_id
+    
+    # =========================================================================
+    # ENCRYPTION METHODS
+    # =========================================================================
+    
+    async def enable_room_encryption(self, room_id: str) -> bool:
+        """
+        Enable end-to-end encryption for a room.
+        
+        Args:
+            room_id: The ID of the room to enable encryption for
+            
+        Returns:
+            bool: True if encryption was enabled successfully
+        """
+        logger.info(f"Enabling encryption for room {room_id}")
+        
+        # Send the encryption state event
+        encryption_content = {
+            "algorithm": "m.megolm.v1.aes-sha2"
+        }
+        
+        response = await self.client.room_put_state(
+            room_id=room_id,
+            event_type="m.room.encryption",
+            content=encryption_content
+        )
+        
+        if isinstance(response, RoomPutStateError):
+            logger.error(f"Failed to enable encryption: {response.message}")
+            return False
+        
+        logger.info(f"Encryption enabled for room {room_id}")
+        return True
+    
+    async def send_encrypted_message(self, room_id: str, message: str) -> Optional[str]:
+        """
+        Send an encrypted message to a room.
+
+        With encryption_enabled=True, nio's room_send() auto-encrypts when the
+        room has encryption enabled, so this simply delegates to send_message().
+
+        Args:
+            room_id: The ID of the room
+            message: The message to send
+
+        Returns:
+            The event ID of the sent message, or None if failed
+        """
+        return await self.send_message(room_id, message)
+    
+    async def trust_device(self, user_id: str, device_id: str) -> bool:
+        """
+        Mark a device as trusted.
+        
+        Args:
+            user_id: The user ID of the device owner
+            device_id: The device ID to trust
+            
+        Returns:
+            bool: True if device was marked as trusted
+        """
+        try:
+            device = self.client.device_store[user_id].get(device_id)
+            if device:
+                device.trust = TrustState.verified
+                logger.info(f"Device {device_id} for user {user_id} is now trusted")
+                return True
+            else:
+                logger.error(f"Device {device_id} not found for user {user_id}")
+                return False
+        except Exception as e:
+            logger.error(f"Error trusting device: {e}")
+            return False
+    
+    async def verify_user_devices(self, user_id: str) -> None:
+        """
+        Verify and optionally trust all devices for a user.
+        
+        Args:
+            user_id: The user ID whose devices to verify
+        """
+        try:
+            devices = self.client.device_store.get(user_id, {})
+            if not devices:
+                logger.info(f"No devices found for user {user_id}")
+                return
+            
+            logger.info(f"Found {len(devices)} device(s) for user {user_id}")
+            
+            for device_id, device in devices.items():
+                logger.info(f"Device {device_id}: {device.display_name or 'Unknown'}")
+                
+                # Auto-trust devices for convenience (in production, you might want verification)
+                if device.trust == TrustState.unset:
+                    logger.info(f"Auto-trusting device {device_id}")
+                    await self.trust_device(user_id, device_id)
+                    
+        except Exception as e:
+            logger.error(f"Error verifying devices for {user_id}: {e}")
+    
+    # =========================================================================
+    # EVENT HANDLING
+    # =========================================================================
+    
+    def on_event(self, event_type: type) -> Callable:
+        """
+        Decorator to register an event handler.
+        
+        Args:
+            event_type: The type of event to handle
+            
+        Example:
+            >>> @bot.on_event(RoomMessageText)
+            ... async def handle_message(room, event):
+            ...     print(f"Message: {event.body}")
+        """
+        def decorator(func: Callable) -> Callable:
+            if event_type not in self._event_handlers:
+                self._event_handlers[event_type] = []
+            self._event_handlers[event_type].append(func)
+            return func
+        return decorator
+    
+    def on_command(self, command: str) -> Callable:
+        """
+        Decorator to register a command handler.
+        
+        Commands are messages that start with the command prefix.
+        
+        Args:
+            command: The command string (without prefix)
+            
+        Example:
+            >>> @bot.on_command("balance")
+            ... async def handle_balance(room, event, args):
+            ...     # Handles "!balance" command
+            ...     await bot.send_message(room.room_id, "Checking balance...")
+        """
+        def decorator(func: Callable) -> Callable:
+            self._command_handlers[command.lower()] = func
+            return func
+        return decorator
+    
+    async def _process_event(self, room, event) -> None:
+        """
+        Process an incoming event and dispatch to handlers.
+        
+        Internal method called for each event during sync.
+        """
+        # Handle encrypted messages
+        if isinstance(event, (MegolmEvent, OlmEvent, UnknownEncryptedEvent)):
+            await self._handle_encrypted_event(room, event)
+            return
+        
+        # Get handlers for this event type
+        handlers = self._event_handlers.get(type(event), [])
+        
+        for handler in handlers:
+            try:
+                await handler(room, event)
+            except Exception as e:
+                logger.error(f"Error in event handler: {e}")
+        
+        # Check for commands in text messages
+        if isinstance(event, RoomMessageText):
+            await self._process_command(room, event)
+    
+    async def _handle_encrypted_event(self, room, event) -> None:
+        """
+        Handle an encrypted event.
+        
+        Args:
+            room: The room object
+            event: The encrypted event
+        """
+        # Try to decrypt the event
+        if isinstance(event, MegolmEvent):
+            # Group message
+            try:
+                decrypted = self.client.decrypt_event(event)
+            except EncryptionError as e:
+                logger.warning(
+                    "Unable to decrypt Megolm event from %s in %s: %s",
+                    getattr(event, "sender", "unknown_sender"),
+                    getattr(event, "room_id", "unknown_room"),
+                    e,
+                )
+                await self._request_missing_room_key(event)
+                return
+            except Exception as e:
+                logger.warning(
+                    "Unexpected Megolm decrypt failure from %s in %s: %s",
+                    getattr(event, "sender", "unknown_sender"),
+                    getattr(event, "room_id", "unknown_room"),
+                    e,
+                )
+                await self._request_missing_room_key(event)
+                return
+
+            if decrypted:
+                logger.info(f"Decrypted Megolm message from {event.sender}")
+
+                # Create a temporary event-like object for handlers
+                class DecryptedEvent:
+                    def __init__(self, decrypted_event, original_event):
+                        self.sender = original_event.sender
+                        self.room_id = original_event.room_id
+                        self.event_id = original_event.event_id
+                        self.timestamp = original_event.server_timestamp
+                        self.body = decrypted_event.body
+                        self.formatted_body = getattr(decrypted_event, 'formatted_body', None)
+                        self.msgtype = getattr(decrypted_event, 'msgtype', 'm.text')
+                        self.decrypted = True
+
+                decrypted_event = DecryptedEvent(decrypted, event)
+
+                # Process like a regular message
+                handlers = self._event_handlers.get(RoomMessageText, [])
+                for handler in handlers:
+                    try:
+                        await handler(room, decrypted_event)
+                    except Exception as e:
+                        logger.error(f"Error in encrypted message handler: {e}")
+
+                # Check for commands
+                await self._process_command(room, decrypted_event)
+            else:
+                logger.warning(
+                    "Megolm event from %s in %s is still undecryptable; requesting room key",
+                    getattr(event, "sender", "unknown_sender"),
+                    getattr(event, "room_id", "unknown_room"),
+                )
+                await self._request_missing_room_key(event)
+
+        elif isinstance(event, OlmEvent):
+            # Direct message (device-to-device)
+            logger.info(f"Received Olm event from {event.sender}")
+            # These are typically key exchange messages, handled automatically by matrix-nio
+    
+    class _DMRoomProxy:
+        """Lightweight proxy that makes command handlers send to a DM room."""
+
+        def __init__(self, dm_room_id: str, original_room):
+            self.room_id = dm_room_id
+            self._original = original_room
+            # Forward common attributes from the real room so handlers don't break
+            self.display_name = getattr(original_room, "display_name", "DM")
+            self.users = getattr(original_room, "users", {})
+            self.encrypted = getattr(original_room, "encrypted", False)
+
+        def __getattr__(self, name):
+            return getattr(self._original, name)
+
+    async def _process_command(self, room, event) -> None:
+        """
+        Check if a message is a command and dispatch to handler.
+        
+        If the command is in ``sensitive_commands`` and the room is a group
+        chat (>2 members), the bot sends a short notice in the group and
+        redirects the full response to a DM with the invoking user.
+        """
+        # Ignore messages from the bot itself
+        if event.sender == self.client.user_id:
+            return
+        
+        # Skip commands during initial sync to avoid replaying old commands
+        if not self._initial_sync_done:
+            return
+        
+        body = event.body.strip()
+        
+        # Check if message starts with command prefix
+        if not body.startswith(self.command_prefix):
+            return
+        
+        # Parse command and arguments
+        parts = body[len(self.command_prefix):].split(maxsplit=1)
+        if not parts:
+            return
+        
+        command = parts[0].lower()
+        args = parts[1] if len(parts) > 1 else ""
+        
+        # Find and execute command handler
+        handler = self._command_handlers.get(command)
+        if handler:
+            # --- Sensitive-command DM redirect ---
+            target_room = room
+            if (
+                command in self.sensitive_commands
+                and self.is_group_room(room.room_id)
+            ):
+                logger.info(
+                    f"Sensitive command '{command}' invoked in group room "
+                    f"{room.room_id} by {event.sender} — redirecting to DM"
+                )
+                dm_room_id = await self.get_or_create_dm(event.sender)
+                if dm_room_id:
+                    # Notify the group that the response was sent privately
+                    await self.send_message(
+                        room.room_id,
+                        f"🔒 Hey {event.sender}, I've sent your `{self.command_prefix}{command}` "
+                        f"results via **direct message** to protect your privacy."
+                    )
+                    target_room = self._DMRoomProxy(dm_room_id, room)
+                else:
+                    # DM creation failed — fall back to the group room
+                    logger.warning(
+                        f"Could not create DM with {event.sender}; "
+                        f"responding in group room instead"
+                    )
+
+            logger.info(f"Dispatching command '{command}' to handler")
+            try:
+                await handler(target_room, event, args)
+                logger.info(f"Command '{command}' handler completed successfully")
+            except Exception as e:
+                logger.error(f"Error in command handler for '{command}': {e}", exc_info=True)
+                await self.send_message(
+                    target_room.room_id,
+                    f"Error executing command: {str(e)}"
+                )
+        else:
+            logger.warning(f"No handler found for command '{command}'. Registered: {list(self._command_handlers.keys())}")
+    
+    # =========================================================================
+    # SYNC AND MAIN LOOP
+    # =========================================================================
+    
+    async def sync_once(self, timeout: int = 30000, full_state: bool = False) -> bool:
+        """
+        Perform a single sync with the server.
+        
+        Fetches new events and updates room state.
+        
+        Args:
+            timeout: Long-polling timeout in milliseconds
+            full_state: Request full room state (needed on first sync for E2EE)
+            
+        Returns:
+            bool: True if sync successful, False otherwise
+        """
+        try:
+            # Ensure the access token is set before syncing
+            if not self.client.access_token:
+                logger.warning("Client access token is None, attempting to restore from backup...")
+                if hasattr(self, '_backup_token'):
+                    self.client.access_token = self._backup_token
+                    logger.info(f"Restored token from backup: {self.client.access_token[:20]}...")
+                else:
+                    logger.error("No access token set for sync and no backup available")
+                    return False
+            
+            # Perform sync
+            logger.debug(f"Syncing with token: {self.client.access_token[:20]}...")
+            response = await self.client.sync(timeout=timeout, full_state=full_state)
+            
+            if isinstance(response, SyncError):
+                logger.error(f"Sync failed: {response.message}")
+                # Check if it's an auth error
+                if "Invalid access token" in str(response.message):
+                    logger.error("Access token appears to be invalid for sync")
+                    logger.error("Please generate a new token from TextRP.")
+                return False
+            
+            # Process events from joined rooms
+            for room_id, room_info in response.rooms.join.items():
+                room = self.client.rooms.get(room_id)
+                if room:
+                    for event in room_info.timeline.events:
+                        await self._process_event(room, event)
+
+            # Process invite events so the bot can auto-join new rooms/DMs
+            for room_id, room_info in response.rooms.invite.items():
+                room = self.client.rooms.get(room_id)
+                if not room:
+                    # For invites, nio stores them in invited_rooms
+                    room = self.client.invited_rooms.get(room_id)
+                if room:
+                    for event in room_info.invite_state:
+                        await self._process_event(room, event)
+
+            # E2EE maintenance: replenish one-time keys and auto-trust devices
+            await self._upload_keys_if_needed()
+            await self._auto_trust_room_devices()
+            
+            return True
+        except Exception as e:
+            logger.error(f"Sync error: {e}")
+            return False
+
+    async def sync_forever(
+        self,
+        timeout: int = 30000,
+        full_state: bool = True
+    ) -> None:
+        """
+        Start the continuous sync loop.
+        
+        This method blocks and continuously syncs with the server,
+        processing events as they arrive.
+        
+        Args:
+            timeout: Long-polling timeout in milliseconds
+            full_state: Whether to request full state on first sync
+        """
+        self._running = True
+        logger.info("Starting sync loop...")
+        
+        # First sync to get current state
+        first_sync = True
+        
+        while self._running:
+            try:
+                if first_sync:
+                    logger.info("Performing initial sync (full_state=True for E2EE room detection)...")
+                    # Use full_state on first sync to get room encryption state
+                    if not await self.sync_once(timeout, full_state=True):
+                        logger.error("Initial sync failed, retrying in 5 seconds...")
+                        await asyncio.sleep(5)
+                        continue
+                    first_sync = False
+                    self._initial_sync_done = True
+
+                    # --- Proactive E2EE bootstrap for encrypted rooms ---
+                    await self._bootstrap_e2ee_sessions()
+
+                    logger.info(f"Initial sync completed successfully — now processing commands (rooms: {len(self.client.rooms)})")
+                    # Log encryption state for all rooms
+                    for rid, r in self.client.rooms.items():
+                        logger.info(f"  Room {r.display_name or rid}: encrypted={r.encrypted}")
+                else:
+                    await self.sync_once(timeout)
+            except Exception as e:
+                logger.error(f"Error during sync: {e}")
+                await asyncio.sleep(5)  # Wait before retrying
+    
+    def stop_sync(self) -> None:
+        """
+        Stop the sync loop.
+        
+        Call this to gracefully stop sync_forever().
+        """
+        logger.info("Stopping sync loop...")
+        self._running = False
+    
+    # =========================================================================
+    # CONVENIENCE METHODS
+    # =========================================================================
+    
+    async def start(self, room_id: Optional[str] = None) -> bool:
+        """
+        Start the bot: login, optionally join a room, and begin syncing.
+        
+        This is a convenience method that combines login, join, and sync.
+        
+        Args:
+            room_id: Optional room ID to join on startup
+            
+        Returns:
+            bool: True if startup successful, False otherwise
+        """
+        # Login
+        if not await self.login():
+            return False
+        
+        # Join room if specified
+        if room_id:
+            if not await self.join_room(room_id):
+                logger.warning(f"Failed to join room {room_id}, continuing anyway")
+        
+        # Start sync loop
+        await self.sync_forever()
+        return True
+    
+    def get_user_wallet_address(self, user_id: str) -> Optional[str]:
+        """
+        Extract the XRP wallet address from a TextRP Matrix user ID.
+        
+        On TextRP, user IDs are in the format: @<wallet_address>:matrix.textrp.io
+        
+        Args:
+            user_id: The full Matrix user ID
+            
+        Returns:
+            str: The XRP wallet address, None if format is invalid
+            
+        Example:
+            >>> bot.get_user_wallet_address("@rWallet123:matrix.textrp.io")
+            'rWallet123'
+        """
+        if not user_id or not user_id.startswith("@"):
+            return None
+        
+        # Extract the localpart (between @ and :)
+        try:
+            localpart = user_id.split(":")[0][1:]  # Remove @ and get before :
+            
+            # Validate it looks like an XRP address (starts with r, 25-35 chars)
+            if localpart.startswith("r") and 25 <= len(localpart) <= 35:
+                return localpart
+            
+            return localpart  # Return anyway, might be valid
+        except (IndexError, ValueError):
+            return None
+    
+    async def get_joined_rooms(self) -> List[str]:
+        """
+        Get list of all rooms the bot has joined.
+        
+        Returns:
+            List[str]: List of room IDs
+        """
+        return list(self.client.rooms.keys())
+
+
+# =============================================================================
+# EXAMPLE USAGE
+# =============================================================================
+
+async def main():
+    """
+    Example usage of the TextRPChatbot.
+    
+    This demonstrates how to initialize and run the bot with
+    command handlers for XRPL wallet balance and weather queries.
+    """
+    # Load configuration from environment
+    homeserver = os.getenv("TEXTRP_HOMESERVER", "https://synapse.textrp.io")
+    username = os.getenv("TEXTRP_USERNAME", "@yourbot:synapse.textrp.io")
+    access_token = os.getenv("TEXTRP_ACCESS_TOKEN", "")
+    room_id = os.getenv("TEXTRP_ROOM_ID")
+    
+    # Create bot instance
+    bot = TextRPChatbot(
+        homeserver=homeserver,
+        username=username,
+        access_token=access_token,
+        device_name="TextRP Bot",
+    )
+    
+    # Register event handlers
+    @bot.on_event(RoomMessageText)
+    async def on_message(room, event):
+        """Handle all text messages."""
+        logger.info(f"[{room.display_name}] {event.sender}: {event.body}")
+    
+    @bot.on_event(RoomMemberEvent)
+    async def on_invite(room, event):
+        """Auto-accept room invites."""
+        if event.membership == "invite" and event.state_key == bot.client.user_id:
+            await bot.join_room(room.room_id)
+            logger.info(f"Accepted invite to room: {room.room_id}")
+    
+    # Optionally join a default room from environment
+    default_room_id = os.getenv("TEXTRP_ROOM_ID")
+    if default_room_id:
+        logger.info(f"Joining default room: {default_room_id}")
+        await bot.join_room(default_room_id)
+    
+    # Register command handlers
+    @bot.on_command("help")
+    async def cmd_help(room, event, args):
+        """Display help message."""
+        help_text = """**Available Commands:**
+• `!help` - Show this help message
+• `!balance [address]` - Check XRP wallet balance
+• `!weather <city or zip>` - Get weather information
+• `!ping` - Check if bot is responsive
+• `!whoami` - Show your Matrix user ID and wallet address
+"""
+        await bot.send_html_message(
+            room.room_id,
+            help_text.replace("**", "").replace("`", ""),
+            help_text.replace("\n", "<br>")
+        )
+    
+    @bot.on_command("ping")
+    async def cmd_ping(room, event, args):
+        """Respond to ping command."""
+        await bot.send_message(room.room_id, "🏓 Pong!")
+    
+    @bot.on_command("whoami")
+    async def cmd_whoami(room, event, args):
+        """Show user's Matrix ID and wallet address."""
+        wallet = bot.get_user_wallet_address(event.sender)
+        response = f"**Matrix ID:** {event.sender}\n"
+        response += f"**Wallet Address:** {wallet or 'Not detected'}"
+        await bot.send_message(room.room_id, response)
+    
+    # Start the bot
+    try:
+        logger.info("Starting Matrix bot...")
+        await bot.start(room_id)
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+    finally:
+        await bot.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
