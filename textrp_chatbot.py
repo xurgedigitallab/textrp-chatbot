@@ -22,6 +22,7 @@ Usage:
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import html
@@ -105,9 +106,16 @@ from nio import (
     RoomHistoryVisibilityEvent,
     RoomJoinRulesEvent,
     RoomEncryptionEvent,
+    MegolmEvent,
+    OlmEvent,
+    UnknownEncryptedEvent,
     Event,
+    
+    # Encryption classes
+    EncryptionError,
 )
 
+from nio.crypto import OlmDevice, TrustState
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -151,6 +159,7 @@ class TextRPChatbot:
         username: str,
         access_token: str = None,
         device_name: str = "TextRP Bot",
+        device_id: Optional[str] = None,
         store_path: str = "./textrp_store",
         invalidate_token_on_shutdown: bool = False,
         config: Optional[AsyncClientConfig] = None
@@ -163,6 +172,7 @@ class TextRPChatbot:
             username: Full Matrix user ID (e.g., @wallet_address:matrix.textrp.io)
             access_token: Access token for authentication
             device_name: Human-readable device name for this session
+            device_id: Stable device ID for E2EE key persistence (auto-generated if omitted)
             store_path: Directory path for storing sync tokens and encryption keys
             config: Optional AsyncClientConfig for advanced configuration
         """
@@ -176,13 +186,16 @@ class TextRPChatbot:
         # Ensure store directory exists for persistent state
         os.makedirs(store_path, exist_ok=True)
         
+        # Resolve a stable device_id for E2EE key persistence
+        self.device_id = self._resolve_device_id(device_id)
+        
         # Default client configuration with encryption support
         if config is None:
             client_config = AsyncClientConfig(
                 max_limit_exceeded=0,
                 max_timeouts=0,
                 store_sync_tokens=True,
-                encryption_enabled=False,
+                encryption_enabled=True,  # Enable E2EE
             )
         else:
             client_config = config
@@ -190,7 +203,7 @@ class TextRPChatbot:
         self.client = AsyncClient(
             homeserver,
             user=self.username,
-            device_id=None,  # Will be assigned on login
+            device_id=self.device_id,
             store_path=self.store_path,
             config=client_config,
         )
@@ -246,8 +259,74 @@ class TextRPChatbot:
         # Flag to control the sync loop
         self._running = False
         
+        # Skip command processing until initial sync completes (avoid replaying old commands)
+        self._initial_sync_done = False
+        
+        # Commands whose output contains personal info and should be sent via DM
+        # when invoked from a group room.  Populated by the caller (e.g. main.py).
+        self.sensitive_commands: set = set()
+        
         logger.info(f"TextRPChatbot initialized for {username} on {homeserver}")
     
+    # =========================================================================
+    # DEVICE ID PERSISTENCE
+    # =========================================================================
+
+    def _resolve_device_id(self, provided_id: Optional[str] = None) -> str:
+        """
+        Resolve a stable device_id for E2EE key persistence.
+
+        Priority: provided_id > saved file > auto-generated.
+        The resolved ID is saved to store_path/device_id for future runs.
+        """
+        device_id_file = os.path.join(self.store_path, "device_id")
+
+        if provided_id:
+            resolved = provided_id.strip()
+        elif os.path.isfile(device_id_file):
+            resolved = open(device_id_file).read().strip()
+            logger.info(f"Loaded persisted device_id: {resolved}")
+        else:
+            tag = hashlib.sha256(self.username.encode()).hexdigest()[:8].upper()
+            resolved = f"TXTRP_{tag}"
+            logger.info(f"Generated new device_id: {resolved}")
+
+        # Persist for next run
+        with open(device_id_file, "w") as f:
+            f.write(resolved)
+
+        return resolved
+
+    async def _upload_keys_if_needed(self) -> None:
+        """Upload Olm identity keys and one-time keys to the homeserver if needed."""
+        try:
+            if self.client.should_upload_keys:
+                logger.info("Uploading E2EE device keys to homeserver...")
+                response = await self.client.keys_upload()
+                logger.info(f"Keys upload response: {response}")
+            else:
+                logger.info("E2EE keys already uploaded, no upload needed")
+        except Exception as e:
+            logger.error(f"Failed to upload E2EE keys: {e}")
+
+    async def _auto_trust_room_devices(self) -> None:
+        """Auto-trust all devices for all users in joined encrypted rooms."""
+        try:
+            for room_id, room in self.client.rooms.items():
+                if not room.encrypted:
+                    continue
+                for user_id in room.users:
+                    devices = self.client.device_store.active_user_devices(user_id)
+                    for device in devices:
+                        if device.trust_state == TrustState.unset:
+                            self.client.verify_device(device)
+                            logger.debug(
+                                f"Auto-trusted device {device.device_id} "
+                                f"for {user_id}"
+                            )
+        except Exception as e:
+            logger.debug(f"Auto-trust sweep error (non-fatal): {e}")
+
     # =========================================================================
     # AUTHENTICATION METHODS
     # =========================================================================
@@ -398,9 +477,21 @@ class TextRPChatbot:
                 
                 logger.info(f"Authentication successful!")
                 logger.info(f"Authenticated as: {whoami}")
+                logger.info(f"Device ID for E2EE: {self.device_id}")
+                logger.info(f"Set TEXTRP_DEVICE_ID={self.device_id} in your .env for persistent encryption keys")
                 
                 # Store token in a safe place for backup
                 self._backup_token = self.access_token
+                
+                # Load the crypto store (Olm account + sessions) for E2EE
+                try:
+                    self.client.load_store()
+                    logger.info("Crypto store loaded successfully")
+                except Exception as e:
+                    logger.warning(f"Could not load crypto store (E2EE may not work): {e}")
+                
+                # Upload Olm identity keys and one-time keys for E2EE
+                await self._upload_keys_if_needed()
                 
                 return True
                 
@@ -525,6 +616,54 @@ class TextRPChatbot:
             invite=[user_id],
             preset="trusted_private_chat",
         )
+    
+    def is_group_room(self, room_id: str) -> bool:
+        """
+        Check whether a room is a group chat (more than 2 members).
+        
+        A room with exactly 2 joined members (the bot and one other user)
+        is treated as a DM; anything larger is a group.
+        
+        Args:
+            room_id: The room to check
+            
+        Returns:
+            bool: True if the room has more than 2 members
+        """
+        room = self.client.rooms.get(room_id)
+        if room is None:
+            return False
+        return len(room.users) > 2
+    
+    async def get_or_create_dm(self, user_id: str) -> Optional[str]:
+        """
+        Find an existing DM room with a user, or create one.
+        
+        Searches joined rooms for a 2-member room containing *only* the bot
+        and the target user.  If none exists, creates a new DM room and waits
+        briefly for the sync to register it.
+        
+        Args:
+            user_id: Matrix user ID to DM (e.g. @rWallet:synapse.textrp.io)
+            
+        Returns:
+            str: The DM room ID, or None on failure
+        """
+        # Look for an existing DM room
+        for rid, room in self.client.rooms.items():
+            members = list(room.users.keys())
+            if len(members) == 2 and user_id in members and self.client.user_id in members:
+                logger.info(f"Found existing DM room {rid} with {user_id}")
+                return rid
+        
+        # No existing DM — create one
+        logger.info(f"Creating new DM room with {user_id}")
+        dm_room_id = await self.create_direct_message_room(user_id)
+        if dm_room_id:
+            logger.info(f"Created DM room {dm_room_id} with {user_id}")
+        else:
+            logger.error(f"Failed to create DM room with {user_id}")
+        return dm_room_id
     
     # =========================================================================
     # ROOM JOIN/LEAVE METHODS
@@ -803,18 +942,68 @@ class TextRPChatbot:
                 }
             }
 
-        async def _send():
-            response = await self.client.room_send(
-                room_id=room_id,
-                message_type="m.room.message",
-                content=content,
-            )
+        # Check if room is encrypted and prepare encryption if needed
+        room = self.client.rooms.get(room_id)
+        
+        # Safety net: if nio thinks room is unencrypted, verify via server state
+        if room and not room.encrypted:
+            try:
+                state_resp = await self.client.room_get_state_event(
+                    room_id, "m.room.encryption"
+                )
+                logger.info(f"Encryption state check for {room_id}: {type(state_resp).__name__}")
+                if isinstance(state_resp, RoomGetStateEventResponse):
+                    logger.info(f"Room {room_id} has m.room.encryption state but nio missed it — treating as encrypted")
+                    room.encrypted = True
+            except Exception as e:
+                logger.warning(f"Could not check encryption state for {room_id}: {e}")
+        
+        if room and room.encrypted:
+            logger.info(f"Room {room_id} is encrypted, preparing E2EE send...")
+            try:
+                # Ensure we have device keys for all room members
+                user_ids = list(room.users.keys())
+                missing = [
+                    u for u in user_ids
+                    if not self.client.device_store.active_user_devices(u)
+                ]
+                if missing:
+                    logger.info(f"Querying keys for {len(missing)} user(s) in encrypted room")
+                    await self.client.keys_query()
 
-            if isinstance(response, RoomSendError):
-                logger.error(f"Failed to send message: {response.message}")
+                # Auto-trust any unset devices so encryption can proceed
+                for user_id in user_ids:
+                    for device in self.client.device_store.active_user_devices(user_id):
+                        if device.trust_state == TrustState.unset:
+                            self.client.verify_device(device)
+                            logger.debug(f"Auto-trusted {device.device_id} for {user_id}")
+
+                # Share outbound group session so we can encrypt outgoing messages
+                try:
+                    await self.client.share_group_session(room_id)
+                except Exception as e:
+                    logger.warning(f"share_group_session for {room_id}: {e}")
+            except Exception as e:
+                logger.warning(f"E2EE prep for {room_id} failed (will attempt send anyway): {e}")
+        else:
+            logger.debug(f"Room {room_id} is {'not encrypted' if room else 'unknown (not in room list)'}")
+
+        async def _send():
+            try:
+                response = await self.client.room_send(
+                    room_id=room_id,
+                    message_type="m.room.message",
+                    content=content,
+                )
+            except Exception as e:
+                logger.error(f"Exception during room_send to {room_id}: {type(e).__name__}: {e}", exc_info=True)
                 return None
 
-            logger.debug(f"Message sent to {room_id}: {message[:50]}...")
+            if isinstance(response, RoomSendError):
+                logger.error(f"Failed to send message to {room_id}: {response.message}")
+                return None
+
+            logger.info(f"Message sent to {room_id} (event: {response.event_id}): {message[:80]}...")
             return response.event_id
 
         return await _send()
@@ -1664,6 +1853,106 @@ class TextRPChatbot:
         return response.event_id
     
     # =========================================================================
+    # ENCRYPTION METHODS
+    # =========================================================================
+    
+    async def enable_room_encryption(self, room_id: str) -> bool:
+        """
+        Enable end-to-end encryption for a room.
+        
+        Args:
+            room_id: The ID of the room to enable encryption for
+            
+        Returns:
+            bool: True if encryption was enabled successfully
+        """
+        logger.info(f"Enabling encryption for room {room_id}")
+        
+        # Send the encryption state event
+        encryption_content = {
+            "algorithm": "m.megolm.v1.aes-sha2"
+        }
+        
+        response = await self.client.room_put_state(
+            room_id=room_id,
+            event_type="m.room.encryption",
+            content=encryption_content
+        )
+        
+        if isinstance(response, RoomPutStateError):
+            logger.error(f"Failed to enable encryption: {response.message}")
+            return False
+        
+        logger.info(f"Encryption enabled for room {room_id}")
+        return True
+    
+    async def send_encrypted_message(self, room_id: str, message: str) -> Optional[str]:
+        """
+        Send an encrypted message to a room.
+
+        With encryption_enabled=True, nio's room_send() auto-encrypts when the
+        room has encryption enabled, so this simply delegates to send_message().
+
+        Args:
+            room_id: The ID of the room
+            message: The message to send
+
+        Returns:
+            The event ID of the sent message, or None if failed
+        """
+        return await self.send_message(room_id, message)
+    
+    async def trust_device(self, user_id: str, device_id: str) -> bool:
+        """
+        Mark a device as trusted.
+        
+        Args:
+            user_id: The user ID of the device owner
+            device_id: The device ID to trust
+            
+        Returns:
+            bool: True if device was marked as trusted
+        """
+        try:
+            device = self.client.device_store[user_id].get(device_id)
+            if device:
+                device.trust = TrustState.verified
+                logger.info(f"Device {device_id} for user {user_id} is now trusted")
+                return True
+            else:
+                logger.error(f"Device {device_id} not found for user {user_id}")
+                return False
+        except Exception as e:
+            logger.error(f"Error trusting device: {e}")
+            return False
+    
+    async def verify_user_devices(self, user_id: str) -> None:
+        """
+        Verify and optionally trust all devices for a user.
+        
+        Args:
+            user_id: The user ID whose devices to verify
+        """
+        try:
+            devices = self.client.device_store.get(user_id, {})
+            if not devices:
+                logger.info(f"No devices found for user {user_id}")
+                return
+            
+            logger.info(f"Found {len(devices)} device(s) for user {user_id}")
+            
+            for device_id, device in devices.items():
+                logger.info(f"Device {device_id}: {device.display_name or 'Unknown'}")
+                
+                # Auto-trust devices for convenience (in production, you might want verification)
+                if device.trust == TrustState.unset:
+                    logger.info(f"Auto-trusting device {device_id}")
+                    await self.trust_device(user_id, device_id)
+                    
+        except Exception as e:
+            logger.error(f"Error verifying devices for {user_id}: {e}")
+    
+    # =========================================================================
     # EVENT HANDLING
     # =========================================================================
     
@@ -1712,6 +2001,11 @@ class TextRPChatbot:
         
         Internal method called for each event during sync.
         """
+        # Handle encrypted messages
+        if isinstance(event, (MegolmEvent, OlmEvent, UnknownEncryptedEvent)):
+            await self._handle_encrypted_event(room, event)
+            return
+        
         # Get handlers for this event type
         handlers = self._event_handlers.get(type(event), [])
         
@@ -1725,12 +2019,85 @@ class TextRPChatbot:
         if isinstance(event, RoomMessageText):
             await self._process_command(room, event)
     
+    async def _handle_encrypted_event(self, room, event) -> None:
+        """
+        Handle an encrypted event.
+        
+        Args:
+            room: The room object
+            event: The encrypted event
+        """
+        try:
+            # Try to decrypt the event
+            if isinstance(event, MegolmEvent):
+                # Group message
+                decrypted = self.client.decrypt_event(event)
+                if decrypted:
+                    logger.info(f"Decrypted Megolm message from {event.sender}")
+                    
+                    # Create a temporary event-like object for handlers
+                    class DecryptedEvent:
+                        def __init__(self, decrypted_event, original_event):
+                            self.sender = original_event.sender
+                            self.room_id = original_event.room_id
+                            self.event_id = original_event.event_id
+                            self.timestamp = original_event.server_timestamp
+                            self.body = decrypted_event.body
+                            self.formatted_body = getattr(decrypted_event, 'formatted_body', None)
+                            self.msgtype = getattr(decrypted_event, 'msgtype', 'm.text')
+                            self.decrypted = True
+                    
+                    decrypted_event = DecryptedEvent(decrypted, event)
+                    
+                    # Process like a regular message
+                    handlers = self._event_handlers.get(RoomMessageText, [])
+                    for handler in handlers:
+                        try:
+                            await handler(room, decrypted_event)
+                        except Exception as e:
+                            logger.error(f"Error in encrypted message handler: {e}")
+                    
+                    # Check for commands
+                    await self._process_command(room, decrypted_event)
+                else:
+                    logger.warning(f"Failed to decrypt message from {event.sender}")
+                    
+            elif isinstance(event, OlmEvent):
+                # Direct message (device-to-device)
+                logger.info(f"Received Olm event from {event.sender}")
+                # These are typically key exchange messages, handled automatically by matrix-nio
+                
+        except Exception as e:
+            logger.error(f"Error handling encrypted event: {e}")
+    
+    class _DMRoomProxy:
+        """Lightweight proxy that makes command handlers send to a DM room."""
+
+        def __init__(self, dm_room_id: str, original_room):
+            self.room_id = dm_room_id
+            self._original = original_room
+            # Forward common attributes from the real room so handlers don't break
+            self.display_name = getattr(original_room, "display_name", "DM")
+            self.users = getattr(original_room, "users", {})
+            self.encrypted = getattr(original_room, "encrypted", False)
+
+        def __getattr__(self, name):
+            return getattr(self._original, name)
+
     async def _process_command(self, room, event) -> None:
         """
         Check if a message is a command and dispatch to handler.
+        
+        If the command is in ``sensitive_commands`` and the room is a group
+        chat (>2 members), the bot sends a short notice in the group and
+        redirects the full response to a DM with the invoking user.
         """
         # Ignore messages from the bot itself
         if event.sender == self.client.user_id:
+            return
+        
+        # Skip commands during initial sync to avoid replaying old commands
+        if not self._initial_sync_done:
             return
         
         body = event.body.strip()
@@ -1750,20 +2117,50 @@ class TextRPChatbot:
         # Find and execute command handler
         handler = self._command_handlers.get(command)
         if handler:
+            # --- Sensitive-command DM redirect ---
+            target_room = room
+            if (
+                command in self.sensitive_commands
+                and self.is_group_room(room.room_id)
+            ):
+                logger.info(
+                    f"Sensitive command '{command}' invoked in group room "
+                    f"{room.room_id} by {event.sender} — redirecting to DM"
+                )
+                dm_room_id = await self.get_or_create_dm(event.sender)
+                if dm_room_id:
+                    # Notify the group that the response was sent privately
+                    await self.send_message(
+                        room.room_id,
+                        f"🔒 Hey {event.sender}, I've sent your `{self.command_prefix}{command}` "
+                        f"results via **direct message** to protect your privacy."
+                    )
+                    target_room = self._DMRoomProxy(dm_room_id, room)
+                else:
+                    # DM creation failed — fall back to the group room
+                    logger.warning(
+                        f"Could not create DM with {event.sender}; "
+                        f"responding in group room instead"
+                    )
+
+            logger.info(f"Dispatching command '{command}' to handler")
             try:
-                await handler(room, event, args)
+                await handler(target_room, event, args)
+                logger.info(f"Command '{command}' handler completed successfully")
             except Exception as e:
-                logger.error(f"Error in command handler for '{command}': {e}")
+                logger.error(f"Error in command handler for '{command}': {e}", exc_info=True)
                 await self.send_message(
-                    room.room_id,
+                    target_room.room_id,
                     f"Error executing command: {str(e)}"
                 )
+        else:
+            logger.warning(f"No handler found for command '{command}'. Registered: {list(self._command_handlers.keys())}")
     
     # =========================================================================
     # SYNC AND MAIN LOOP
     # =========================================================================
     
-    async def sync_once(self, timeout: int = 30000) -> bool:
+    async def sync_once(self, timeout: int = 30000, full_state: bool = False) -> bool:
         """
         Perform a single sync with the server.
         
@@ -1771,6 +2168,7 @@ class TextRPChatbot:
         
         Args:
             timeout: Long-polling timeout in milliseconds
+            full_state: Request full room state (needed on first sync for E2EE)
             
         Returns:
             bool: True if sync successful, False otherwise
@@ -1788,7 +2186,7 @@ class TextRPChatbot:
             
             # Perform sync
             logger.debug(f"Syncing with token: {self.client.access_token[:20]}...")
-            response = await self.client.sync(timeout=timeout)
+            response = await self.client.sync(timeout=timeout, full_state=full_state)
             
             if isinstance(response, SyncError):
                 logger.error(f"Sync failed: {response.message}")
@@ -1804,6 +2202,10 @@ class TextRPChatbot:
                 if room:
                     for event in room_info.timeline.events:
                         await self._process_event(room, event)
+            
+            # E2EE maintenance: replenish one-time keys and auto-trust devices
+            await self._upload_keys_if_needed()
+            await self._auto_trust_room_devices()
             
             return True
         except Exception as e:
@@ -1834,14 +2236,18 @@ class TextRPChatbot:
         while self._running:
             try:
                 if first_sync:
-                    logger.info("Performing initial sync...")
-                    # Use sync_once for consistency
-                    if not await self.sync_once(timeout):
+                    logger.info("Performing initial sync (full_state=True for E2EE room detection)...")
+                    # Use full_state on first sync to get room encryption state
+                    if not await self.sync_once(timeout, full_state=True):
                         logger.error("Initial sync failed, retrying in 5 seconds...")
                         await asyncio.sleep(5)
                         continue
                     first_sync = False
-                    logger.info("Initial sync completed successfully")
+                    self._initial_sync_done = True
+                    logger.info(f"Initial sync completed successfully — now processing commands (rooms: {len(self.client.rooms)})")
+                    # Log encryption state for all rooms
+                    for rid, r in self.client.rooms.items():
+                        logger.info(f"  Room {r.display_name or rid}: encrypted={r.encrypted}")
                 else:
                     await self.sync_once(timeout)
             except Exception as e:
