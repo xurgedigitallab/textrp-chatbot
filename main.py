@@ -284,7 +284,14 @@ class TextRPBot:
                 logger.info(f"Accepting invite to room: {room.room_id}")
                 await self.textrp.join_room(room.room_id)
                 logger.info(f"Joined room: {room.room_id}")
-                
+
+                # Sync so nio registers the new room and its members
+                await self.textrp.sync_once(timeout=5000)
+
+                # Query device keys & trust devices for the new room
+                await self.textrp.client.keys_query()
+                await self.textrp._auto_trust_room_devices()
+
                 # Record the room join
                 await self.faucet_db.record_room_join(room.room_id, room.display_name)
                 
@@ -357,7 +364,7 @@ Type `{self.config.command_prefix}help` to see all available commands!
 • Put your TXT to work and earn passive income
 
 **XRPL / Wallet:**
-• `{self.config.command_prefix}balance` - Check your XRP balance
+• `{self.config.command_prefix}balance` - Check your XRP and {self.config.faucet_currency_code} balance
 • `{self.config.command_prefix}tokens` - Show your token balances
 • `{self.config.command_prefix}history` - View your claim history
 
@@ -389,7 +396,7 @@ Type `{self.config.command_prefix}help` to see all available commands!
             
             # If we detected a wallet, offer to check balance
             if wallet:
-                response += f"\nUse `{self.config.command_prefix}balance` to check your XRP balance."
+                response += f"\nUse `{self.config.command_prefix}balance` to check your XRP and {self.config.faucet_currency_code} balance."
             
             await self.textrp.send_message(room.room_id, response)
         
@@ -487,7 +494,7 @@ Type `{self.config.command_prefix}help` to see all available commands!
                     if strict.get('success'):
                         account_data = strict.get('result', {})
                         balance = self.xrpl.drops_to_xrp(account_data.get('Balance', '0'))
-                        msg += f"  Balance: {balance} XRP\n"
+                        msg += f"  Balance: {balance:,.6f} XRP\n"
                         msg += f"  Sequence: {account_data.get('Sequence', 'N/A')}\n"
                     else:
                         msg += f"  Error: {strict.get('result', strict.get('error', 'Unknown'))}\n"
@@ -499,7 +506,7 @@ Type `{self.config.command_prefix}help` to see all available commands!
                     if not_strict.get('success'):
                         account_data = not_strict.get('result', {})
                         balance = self.xrpl.drops_to_xrp(account_data.get('Balance', '0'))
-                        msg += f"  Balance: {balance} XRP\n"
+                        msg += f"  Balance: {balance:,.6f} XRP\n"
                         msg += f"  Sequence: {account_data.get('Sequence', 'N/A')}\n"
                     else:
                         msg += f"  Error: {not_strict.get('result', not_strict.get('error', 'Unknown'))}\n"
@@ -568,6 +575,22 @@ Type `{self.config.command_prefix}help` to see all available commands!
                 else:
                     balance = self.xrpl.drops_to_xrp(account_info.get("Balance", "0"))
                     response_msg = f"💰 **Balance:** {balance:,.6f} XRP\n"
+
+                    # Fetch faucet token balance
+                    currency = self.config.faucet_currency_code
+                    issuer = self.config.token_issuer
+                    if issuer:
+                        try:
+                            trust_line = await self.xrpl.check_trust_line(address, currency, issuer)
+                            if trust_line:
+                                token_balance = float(trust_line.get("balance", "0"))
+                                token_balance_str = f"{token_balance:,.6f}".rstrip('0').rstrip('.')
+                                response_msg += f"💎 **{currency} Balance:** {token_balance_str}\n"
+                            else:
+                                response_msg += f"⚠️ No trust line for **{currency}** (use `{self.config.command_prefix}trust` to check)\n"
+                        except Exception as e:
+                            logger.warning(f"Error fetching {currency} balance: {e}")
+
                     response_msg += f"Address: `{address}`\n"
                     response_msg += f"Sequence: {account_info.get('Sequence', 'N/A')}"
                     
@@ -868,13 +891,13 @@ Use the link above to create your trust line."""
                     # Build success message
                     msg = f"""✅ **Faucet Claim Successful!**
 
-You received **{final_amount} {self.config.faucet_currency_code}** tokens!
+You received **{final_amount:,} {self.config.faucet_currency_code}** tokens!
 
 **Payout Breakdown:**
-• Base Amount: {base_amount} {self.config.faucet_currency_code}
+• Base Amount: {base_amount:,} {self.config.faucet_currency_code}
 • Matching LP NFTs: {nft_count}
 • Multiplier: {multiplier}
-• Final Payout: {final_amount} {self.config.faucet_currency_code}
+• Final Payout: {final_amount:,} {self.config.faucet_currency_code}
 
 **Transaction:** {result['tx_hash'][:12]}...{result['tx_hash'][-8:]}
 **Explorer:** [View Transaction]({result['explorer_url']})
