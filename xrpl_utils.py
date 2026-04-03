@@ -17,7 +17,9 @@ Usage:
 
 import asyncio
 import logging
-from typing import Optional, Dict, Any, List, Union
+import os
+from functools import lru_cache
+from typing import Optional, Dict, Any, List, Union, Tuple
 from decimal import Decimal
 from datetime import datetime
 
@@ -48,6 +50,9 @@ try:
 except ImportError:
     RETRY_AVAILABLE = False
     XRPL_RETRY_EXCEPTIONS = (ConnectionError, TimeoutError, asyncio.TimeoutError, OSError)
+
+# Decimal constant for faucet balance calculation (avoid string conversion overhead)
+FAUCET_BALANCE_FACTOR = Decimal("0.000001")
 
 # Configure logging
 logging.basicConfig(
@@ -131,13 +136,69 @@ class XRPLClient:
         # Initialize the async client
         self.client = AsyncJsonRpcClient(self.rpc_url)
         
+        # Pre-parse LP_INFO environment variable for NFT multiplier lookups
+        self._lp_nfts: List[Tuple[str, int]] = self._parse_lp_info()
+        
         logger.info(f"XRPLClient initialized for {self.network} at {self.rpc_url}")
+    
+    def _parse_lp_info(self) -> List[Tuple[str, int]]:
+        """
+        Parse LP_INFO environment variable into list of (issuer, taxon) tuples.
+        
+        Expected format: issuer:taxon,issuer:taxon
+        Example: rIssuer1:123,rIssuer2:456
+        
+        Returns:
+            List of validated (issuer_address, taxon_int) tuples
+        """
+        lp_info_raw = os.getenv("LP_INFO", "").strip()
+        if not lp_info_raw:
+            return []
+        
+        parsed: List[Tuple[str, int]] = []
+        for entry in [e.strip() for e in lp_info_raw.split(",") if e.strip()]:
+            if ":" not in entry:
+                continue
+            
+            parts = [p.strip() for p in entry.split(":", 1)]
+            if len(parts) != 2:
+                continue
+            
+            issuer, taxon_str = parts
+            if not issuer or not taxon_str:
+                continue
+            
+            try:
+                taxon = int(taxon_str)
+            except ValueError:
+                continue
+            
+            if not self.is_valid_address(issuer):
+                continue
+            
+            parsed.append((issuer, taxon))
+        
+        if parsed:
+            logger.info(f"LP_INFO parsed: {len(parsed)} valid NFT collection(s) configured")
+        
+        return parsed
+    
+    @property
+    def lp_nfts(self) -> List[Tuple[str, int]]:
+        """
+        Get the list of configured LP NFT collections.
+        
+        Returns:
+            List of (issuer_address, taxon) tuples
+        """
+        return self._lp_nfts
     
     # =========================================================================
     # UTILITY METHODS
     # =========================================================================
     
     @staticmethod
+    @lru_cache(maxsize=1024)
     def is_valid_address(address: str) -> bool:
         """
         Validate an XRP wallet address.

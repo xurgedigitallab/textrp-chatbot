@@ -397,6 +397,49 @@ class TextRPChatbot:
         except Exception as e:
             logger.warning("E2EE bootstrap error (non-fatal): %s", e)
 
+    async def bootstrap_room_e2ee(self, room_id: str) -> None:
+        """Bootstrap E2EE for a single newly-joined room.
+
+        Performs key query, one-time key claiming, device trust, key upload,
+        and group session sharing so the other party can include us in their
+        Megolm sessions.
+        """
+        room = self.client.rooms.get(room_id)
+        if not room or not room.encrypted:
+            logger.debug("Room %s not encrypted or not found — skipping E2EE bootstrap", room_id)
+            return
+
+        try:
+            # 1. Query device keys (only if nio thinks it's needed)
+            if self.client.should_query_keys:
+                logger.info("E2EE room bootstrap (%s): querying device keys", room_id)
+                await self.client.keys_query()
+
+            # 2. Claim one-time keys to establish Olm sessions
+            if self.client.should_claim_keys:
+                users_for_claim = self.client.get_users_for_key_claiming()
+                if users_for_claim:
+                    logger.info(
+                        "E2EE room bootstrap (%s): claiming one-time keys for %d user(s)",
+                        room_id, len(users_for_claim),
+                    )
+                    await self.client.keys_claim(users_for_claim)
+
+            # 3. Auto-trust all devices in the room
+            await self._auto_trust_room_devices()
+
+            # 4. Upload our own keys if needed
+            await self._upload_keys_if_needed()
+
+            # 5. Share our outbound group session so the other side discovers us
+            await self.client.share_group_session(room_id)
+            logger.info(
+                "E2EE room bootstrap (%s): shared group session for %s",
+                room_id, room.display_name or room_id,
+            )
+        except Exception as e:
+            logger.warning("E2EE room bootstrap error for %s (non-fatal): %s", room_id, e)
+
     async def _request_missing_room_key(self, event: MegolmEvent) -> None:
         """Request a missing Megolm room key for an undecryptable event."""
         room_id = getattr(event, "room_id", "") or "unknown_room"

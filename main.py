@@ -38,7 +38,7 @@ from dotenv import load_dotenv
 
 # Import our modules
 from textrp_chatbot import TextRPChatbot
-from xrpl_utils import XRPLClient
+from xrpl_utils import XRPLClient, FAUCET_BALANCE_FACTOR
 from xrpl.wallet import Wallet
 from xrpl.constants import CryptoAlgorithm
 from xrpl.models.requests import AccountLines
@@ -288,9 +288,8 @@ class TextRPBot:
                 # Sync so nio registers the new room and its members
                 await self.textrp.sync_once(timeout=5000)
 
-                # Query device keys & trust devices for the new room
-                await self.textrp.client.keys_query()
-                await self.textrp._auto_trust_room_devices()
+                # Full E2EE handshake for the new room
+                await self.textrp.bootstrap_room_e2ee(room.room_id)
 
                 # Record the room join
                 await self.faucet_db.record_room_join(room.room_id, room.display_name)
@@ -789,7 +788,7 @@ Use the link above to create your trust line."""
                 base_amount_source = "configured_daily_amount"
                 if faucet_trust and Decimal(faucet_trust["balance"]) > 0:
                     faucet_balance = Decimal(faucet_trust["balance"])
-                    base_amount = int(faucet_balance * Decimal("0.000001"))
+                    base_amount = int(faucet_balance * FAUCET_BALANCE_FACTOR)
                     base_amount_source = "faucet_trust_balance"
                 else:
                     base_amount = int(self.config.faucet_daily_amount)
@@ -805,42 +804,29 @@ Use the link above to create your trust line."""
                 multiplier = 1.0
                 nft_count = 0
                 
-                lp_info_raw = os.getenv("LP_INFO", "").strip()
-                if lp_info_raw:
-                    # Parse LP_INFO (same logic as in lp command)
-                    configured: list[tuple[str, int]] = []
-                    for entry in [e.strip() for e in lp_info_raw.split(",") if e.strip()]:
-                        if ":" in entry:
-                            issuer, taxon_str = [p.strip() for p in entry.split(":", 1)]
-                            try:
-                                taxon = int(taxon_str)
-                                if self.xrpl.is_valid_address(issuer):
-                                    configured.append((issuer, taxon))
-                            except ValueError:
-                                continue
-                    
-                    if configured:
-                        # Get user's NFTs
-                        nfts = await self.xrpl.get_account_nfts(user_wallet)
-                        if nfts:
-                            configured_set = set(configured)
-                            for nft in nfts:
-                                nft_issuer = nft.get("Issuer") or nft.get("issuer")
-                                nft_taxon_raw = nft.get("NFTokenTaxon") if "NFTokenTaxon" in nft else nft.get("nft_taxon")
-                                if nft_issuer and nft_taxon_raw is not None:
-                                    try:
-                                        nft_taxon = int(nft_taxon_raw)
-                                        if (str(nft_issuer), nft_taxon) in configured_set:
-                                            nft_count += 1
-                                    except (TypeError, ValueError):
-                                        continue
-                            
-                            if nft_count <= 0:
-                                multiplier = 1.0
-                            elif nft_count == 1:
-                                multiplier = 1.5
-                            else:
-                                multiplier = float(nft_count)
+                configured = self.xrpl.lp_nfts
+                if configured:
+                    # Get user's NFTs
+                    nfts = await self.xrpl.get_account_nfts(user_wallet)
+                    if nfts:
+                        configured_set = set(configured)
+                        for nft in nfts:
+                            nft_issuer = nft.get("Issuer") or nft.get("issuer")
+                            nft_taxon_raw = nft.get("NFTokenTaxon") if "NFTokenTaxon" in nft else nft.get("nft_taxon")
+                            if nft_issuer and nft_taxon_raw is not None:
+                                try:
+                                    nft_taxon = int(nft_taxon_raw)
+                                    if (str(nft_issuer), nft_taxon) in configured_set:
+                                        nft_count += 1
+                                except (TypeError, ValueError):
+                                    continue
+                        
+                        if nft_count <= 0:
+                            multiplier = 1.0
+                        elif nft_count == 1:
+                            multiplier = 1.5
+                        else:
+                            multiplier = float(nft_count)
                 
                 # Apply multiplier to base amount
                 final_amount = int(base_amount * multiplier)
@@ -905,7 +891,7 @@ You received **{final_amount:,} {self.config.faucet_currency_code}** tokens!
 Come back in {self.config.faucet_cooldown_hours} hours for your next claim!"""
                     
                     # If user has no multiplier NFTs, recommend purchasing
-                    if nft_count == 0 and lp_info_raw:
+                    if nft_count == 0 and self.xrpl.lp_nfts:
                         msg += f"""\n\n🎫 **Boost Your Rewards!**\nYou're currently earning at the base rate. Purchase a Multiplier NFT to increase your daily faucet claims!\n• 1 NFT = 1.5× rewards\n• 2+ NFTs = even higher multipliers!\n\n🛒 **Get yours at:** https://txt.textrp.io"""
                     
                     await self.textrp.send_message(room.room_id, msg)
@@ -1100,44 +1086,12 @@ Please create a trust line to receive tokens."""
             await self.textrp.send_typing(room.room_id, True)
             
             try:
-                lp_info_raw = os.getenv("LP_INFO", "").strip()
-
-                if not lp_info_raw:
-                    await self.textrp.send_message(
-                        room.room_id,
-                        "❌ LP_INFO is not configured. Ask an admin to set LP_INFO in the bot environment."
-                    )
-                    return
-
-                configured: list[tuple[str, int]] = []
-                invalid_entries: list[str] = []
-                for entry in [e.strip() for e in lp_info_raw.split(",") if e.strip()]:
-                    if ":" not in entry:
-                        invalid_entries.append(entry)
-                        continue
-
-                    issuer, taxon_str = [p.strip() for p in entry.split(":", 1)]
-                    if not issuer or not taxon_str:
-                        invalid_entries.append(entry)
-                        continue
-
-                    try:
-                        taxon = int(taxon_str)
-                    except ValueError:
-                        invalid_entries.append(entry)
-                        continue
-
-                    if not self.xrpl.is_valid_address(issuer):
-                        invalid_entries.append(entry)
-                        continue
-
-                    configured.append((issuer, taxon))
+                configured = self.xrpl.lp_nfts
 
                 if not configured:
                     await self.textrp.send_message(
                         room.room_id,
-                        "❌ LP_INFO is configured but no valid entries were found. "
-                        "Expected format: issuer:taxon,issuer:taxon"
+                        "❌ LP_INFO is not configured. Ask an admin to set LP_INFO in the bot environment."
                     )
                     return
 
@@ -1186,11 +1140,6 @@ Please create a trust line to receive tokens."""
 **LP NFTs Owned:** {nft_count}
 **Faucet Multiplier:** {multiplier}
 """
-
-                if invalid_entries:
-                    msg += "\n⚠️ **Invalid LP_INFO entries (ignored):**\n"
-                    for bad in invalid_entries[:10]:
-                        msg += f"• `{bad}`\n"
 
                 if matched_collections:
                     msg += "\n✅ **Matched collections:**\n"
@@ -1362,27 +1311,11 @@ You'll be notified 1 hour before your faucet claim is available.
             bool: True if user has NFTs, False otherwise
         """
         try:
-            # Get LP_INFO from environment
-            lp_info_raw = os.getenv("LP_INFO", "").strip()
-            
-            if not lp_info_raw:
-                # LP_INFO not configured, can't check NFTs
-                return True
-            
-            # Parse LP_INFO
-            configured: list[tuple[str, int]] = []
-            for entry in [e.strip() for e in lp_info_raw.split(",") if e.strip()]:
-                if ":" in entry:
-                    issuer, taxon_str = [p.strip() for p in entry.split(":", 1)]
-                    try:
-                        taxon = int(taxon_str)
-                        if self.xrpl.is_valid_address(issuer):
-                            configured.append((issuer, taxon))
-                    except ValueError:
-                        continue
+            # Get pre-parsed LP_INFO from XRPL client
+            configured = self.xrpl.lp_nfts
             
             if not configured:
-                # No valid LP NFTs configured
+                # LP_INFO not configured or invalid, can't check NFTs
                 return True
             
             # Get user's NFTs
