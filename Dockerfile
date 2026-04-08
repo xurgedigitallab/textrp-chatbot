@@ -1,27 +1,18 @@
-FROM evernode/sashimono:hp.latest-ubt.20.04
+FROM evernode/sashimono:hp.latest-ubt.20.04-njs.20
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
+ENV NODE_ENV=production \
     HP_STATE_DIR=/hp/state
 
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        python3 \
-        python3-pip \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+COPY package.json package-lock.json tsconfig.json ./
+RUN npm ci
 
-COPY requirements.txt /app/requirements.txt
-RUN python3 -m pip install --no-cache-dir -r /app/requirements.txt
-
-COPY . /app
+COPY src ./src
+RUN npm run build
 
 RUN mkdir -p /hp/state
 
 EXPOSE 9009
 
-ENTRYPOINT ["python3"]
-CMD ["main.py"]
+CMD ["npm", "start"]

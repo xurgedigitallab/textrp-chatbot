@@ -31,7 +31,7 @@ Environment Variables:
     TEXTRP_ROOM_ID     - Optional default room to join
     XRPL_NETWORK       - XRPL network (mainnet/testnet/devnet)
     HP_STATE_DIR       - Sashimono HP state directory (default: /hp/state)
-    FAUCET_DB_PATH     - SQLite path override (absolute or relative)
+    FAUCET_DB_PATH     - JSON faucet state path override (absolute or relative)
 """
 
 import asyncio
@@ -54,6 +54,8 @@ from xrpl.wallet import Wallet
 from xrpl.constants import CryptoAlgorithm
 from xrpl.models.requests import AccountLines
 from faucet_db import FaucetDB
+
+XRPL_UNIX_EPOCH_OFFSET = 946684800
 
 # Import Matrix event types for handlers
 from nio import RoomMessageText, RoomMemberEvent, InviteMemberEvent
@@ -241,7 +243,11 @@ class TextRPBot:
         # Initialize faucet database
         faucet_db_file = Path(config.faucet_db_path)
         faucet_db_file.parent.mkdir(parents=True, exist_ok=True)
-        self.faucet_db = FaucetDB(config.faucet_db_path)
+        self.faucet_db = FaucetDB(
+            config.faucet_db_path,
+            cooldown_hours=config.faucet_cooldown_hours,
+            epoch_provider=self._get_deterministic_epoch,
+        )
         
         # Initialize faucet wallet if configured
         self.faucet_wallet = None
@@ -271,6 +277,22 @@ class TextRPBot:
     def request_shutdown(self) -> None:
         """Signal background tasks and appservice runtime to stop."""
         self._shutdown_event.set()
+
+    async def _get_deterministic_epoch(self) -> int:
+        """
+        Resolve deterministic epoch seconds from validated XRPL ledger time.
+
+        XRPL close_time is seconds since 2000-01-01; convert to Unix epoch.
+        """
+        ledger = await self.xrpl.get_ledger_info("validated")
+        if not ledger:
+            raise RuntimeError("Validated ledger info unavailable")
+
+        close_time = ledger.get("close_time")
+        if close_time is None:
+            raise RuntimeError("Validated ledger close_time unavailable")
+
+        return int(close_time) + XRPL_UNIX_EPOCH_OFFSET
     
     def _register_events(self) -> None:
         """Register TextRP event handlers."""
@@ -904,8 +926,10 @@ Use the link above to create your trust line."""
                 # Schedule reminder for next claim if user has preferences
                 user_prefs = await self.faucet_db.get_user_preferences(user_wallet)
                 if user_prefs and user_prefs.get("reminders_enabled", True):
-                    reminder_offset = user_prefs.get("reminder_offset", 1)
-                    reminder_time = datetime.now() + timedelta(hours=self.config.faucet_cooldown_hours - reminder_offset)
+                    reminder_offset = int(user_prefs.get("reminder_offset", 1))
+                    deterministic_now = await self._get_deterministic_epoch()
+                    reminder_seconds = max(self.config.faucet_cooldown_hours - reminder_offset, 0) * 3600
+                    reminder_time = deterministic_now + reminder_seconds
                     reminder_msg = f"⏰ Reminder: Your {self.config.faucet_currency_code} faucet claim will be available soon! Use `{self.config.command_prefix}faucet` to claim."
                     await self.faucet_db.schedule_reminder(user_wallet, room.room_id, reminder_time, reminder_msg)
                 

@@ -56,3 +56,7 @@ logs/
 .pytest_cache/
 .coverage
 htmlcov/
+node_modules/
+coverage/
+.vitest/
+.matrix-appservice-storage.json
