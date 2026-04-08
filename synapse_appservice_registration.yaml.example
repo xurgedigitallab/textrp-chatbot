@@ -1,0 +1,13 @@
+id: textrp-bot
+url: https://bot.example.com
+as_token: replace_with_generated_appservice_token
+hs_token: replace_with_generated_homeserver_token
+sender_localpart: yourbot
+rate_limited: false
+
+namespaces:
+  users:
+    - exclusive: true
+      regex: "^@yourbot:example\\.com$"
+  aliases: []
+  rooms: []

@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  textrp-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: textrp-chatbot:appservice
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HP_STATE_DIR: /hp/state
+      FAUCET_DB_PATH: /hp/state/faucet.db
+    ports:
+      - "9009:9009"
+    volumes:
+      - hp_state:/hp/state
+
+volumes:
+  hp_state:

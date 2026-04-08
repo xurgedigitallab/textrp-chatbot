@@ -21,12 +21,15 @@ Usage:
     await bot.start()
 """
 
+from __future__ import annotations
+
 import asyncio
 import hashlib
 import logging
 import os
 import html
 import re
+from types import SimpleNamespace
 from typing import Optional, List, Dict, Any, Callable, Union
 from datetime import datetime, timezone
 
@@ -2344,6 +2347,75 @@ class TextRPChatbot:
                 )
         else:
             logger.warning(f"No handler found for command '{command}'. Registered: {list(self._command_handlers.keys())}")
+
+    async def dispatch_appservice_events(self, events: List[Dict[str, Any]]) -> int:
+        """
+        Dispatch Synapse appservice transaction events through the existing
+        event/command processing pipeline.
+
+        Args:
+            events: Raw event dictionaries from a transaction payload.
+
+        Returns:
+            int: Number of parsed events processed.
+        """
+        if not events:
+            return 0
+
+        # Appservice mode does not run /sync first; enable command processing.
+        self._initial_sync_done = True
+
+        events_by_room: Dict[str, List[Dict[str, Any]]] = {}
+        for event in events:
+            room_id = event.get("room_id")
+            if not room_id:
+                continue
+            events_by_room.setdefault(room_id, []).append(event)
+
+        processed = 0
+        for room_id, room_events in events_by_room.items():
+            sync_payload = {
+                "next_batch": "appservice-transaction",
+                "rooms": {
+                    "join": {
+                        room_id: {
+                            "summary": {},
+                            "state": {"events": []},
+                            "timeline": {
+                                "events": room_events,
+                                "limited": False,
+                                "prev_batch": "appservice-transaction",
+                            },
+                            "ephemeral": {"events": []},
+                            "account_data": {"events": []},
+                            "unread_notifications": {},
+                        }
+                    }
+                },
+            }
+
+            parsed_response = SyncResponse.from_dict(sync_payload)
+            if isinstance(parsed_response, SyncError):
+                logger.error(
+                    "Failed to parse appservice transaction events for %s: %s",
+                    room_id,
+                    parsed_response.message,
+                )
+                continue
+
+            joined_room_info = parsed_response.rooms.join.get(room_id)
+            if joined_room_info is None:
+                continue
+
+            room = self.client.rooms.get(room_id)
+            if room is None:
+                room = SimpleNamespace(room_id=room_id, display_name=room_id)
+
+            for parsed_event in joined_room_info.timeline.events:
+                await self._process_event(room, parsed_event)
+                processed += 1
+
+        return processed
     
     # =========================================================================
     # SYNC AND MAIN LOOP

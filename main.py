@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 TextRP Chatbot - Main Entry Point
 ===================================
@@ -18,10 +20,18 @@ Usage:
 
 Environment Variables:
     TEXTRP_HOMESERVER  - TextRP homeserver URL
-    TEXTRP_USERNAME    - Bot's TextRP user ID
-    TEXTRP_ACCESS_TOKEN - Bot's access token
+    TEXTRP_USERNAME    - Appservice sender user ID
+    MATRIX_AS_TOKEN    - Appservice outbound token
+    MATRIX_HS_TOKEN    - Homeserver inbound token
+    MATRIX_AS_URL      - Public callback URL used in registration
+    MATRIX_AS_HOST     - Appservice bind host
+    MATRIX_AS_PORT     - Appservice bind port
+    MATRIX_AS_ID       - Appservice ID
+    MATRIX_AS_SENDER_LOCALPART - Appservice sender localpart
     TEXTRP_ROOM_ID     - Optional default room to join
     XRPL_NETWORK       - XRPL network (mainnet/testnet/devnet)
+    HP_STATE_DIR       - Sashimono HP state directory (default: /hp/state)
+    FAUCET_DB_PATH     - SQLite path override (absolute or relative)
 """
 
 import asyncio
@@ -37,6 +47,7 @@ from typing import Optional
 from dotenv import load_dotenv
 
 # Import our modules
+from appservice_server import MatrixAppServiceServer
 from textrp_chatbot import TextRPChatbot
 from xrpl_utils import XRPLClient, FAUCET_BALANCE_FACTOR
 from xrpl.wallet import Wallet
@@ -87,10 +98,16 @@ class BotConfig:
             "TEXTRP_USERNAME",
             "@yourbot:synapse.textrp.io"
         )
-        self.textrp_access_token = os.getenv("TEXTRP_ACCESS_TOKEN", "")
         self.textrp_device_name = os.getenv("TEXTRP_DEVICE_NAME", "TextRP Bot")
         self.textrp_device_id = os.getenv("TEXTRP_DEVICE_ID", "")
         self.textrp_room_id = os.getenv("TEXTRP_ROOM_ID")
+        self.matrix_as_token = os.getenv("MATRIX_AS_TOKEN", "")
+        self.matrix_hs_token = os.getenv("MATRIX_HS_TOKEN", "")
+        self.matrix_as_url = os.getenv("MATRIX_AS_URL", "")
+        self.matrix_as_host = os.getenv("MATRIX_AS_HOST", "0.0.0.0")
+        self.matrix_as_port = int(os.getenv("MATRIX_AS_PORT", "9009"))
+        self.matrix_as_id = os.getenv("MATRIX_AS_ID", "")
+        self.matrix_as_sender_localpart = os.getenv("MATRIX_AS_SENDER_LOCALPART", "")
         
         # XRPL configuration
         self.xrpl_network = os.getenv("XRPL_NETWORK", "mainnet")
@@ -111,7 +128,8 @@ class BotConfig:
             or self.faucet_cold_wallet
         )
         self.faucet_admin_users = os.getenv("FAUCET_ADMIN_USERS", "").split(",") if os.getenv("FAUCET_ADMIN_USERS") else []
-        self.faucet_db_path = os.getenv("FAUCET_DB_PATH", "faucet.db")
+        self.hp_state_dir = os.getenv("HP_STATE_DIR", "/hp/state")
+        self.faucet_db_path = self._resolve_faucet_db_path(os.getenv("FAUCET_DB_PATH", "faucet.db"))
         
         # Bot settings
         self.command_prefix = os.getenv("BOT_COMMAND_PREFIX", "!")
@@ -120,15 +138,31 @@ class BotConfig:
             "INVALIDATE_TOKEN_ON_SHUTDOWN",
             "false"
         ).lower() == "true"
+
+    def _resolve_faucet_db_path(self, raw_path: str) -> str:
+        """
+        Resolve faucet DB location with HP state semantics:
+        - absolute FAUCET_DB_PATH wins
+        - relative/no path resolves to HP_STATE_DIR/faucet.db
+        """
+        candidate = Path(raw_path or "faucet.db")
+        if candidate.is_absolute():
+            return str(candidate)
+        return str(Path(self.hp_state_dir) / "faucet.db")
     
     def validate(self) -> bool:
         """Validate that required configuration is present."""
-        # TextRP requires access token (bearer token authentication)
-        if not self.textrp_access_token:
-            logger.error(
-                "TEXTRP_ACCESS_TOKEN is required for TextRP authentication"
-            )
-            return False
+        required_values = {
+            "MATRIX_AS_TOKEN": self.matrix_as_token,
+            "MATRIX_HS_TOKEN": self.matrix_hs_token,
+            "MATRIX_AS_URL": self.matrix_as_url,
+            "MATRIX_AS_ID": self.matrix_as_id,
+            "MATRIX_AS_SENDER_LOCALPART": self.matrix_as_sender_localpart,
+        }
+        for key, value in required_values.items():
+            if not value:
+                logger.error(f"{key} is required for appservice mode")
+                return False
         
         if self.textrp_username == "@yourbot:synapse.textrp.io":
             logger.warning(
@@ -136,6 +170,12 @@ class BotConfig:
                 "Set TEXTRP_USERNAME environment variable."
             )
         
+        if not self.textrp_username.startswith("@") or ":" not in self.textrp_username:
+            logger.error(
+                "TEXTRP_USERNAME must be a full Matrix user ID, for example @bot:example.com"
+            )
+            return False
+
         return True
 
 
@@ -165,14 +205,13 @@ class TextRPBot:
         """
         self.config = config
         self._shutdown_event = asyncio.Event()
+        self.appservice_server: Optional[MatrixAppServiceServer] = None
         
         # Initialize TextRP client
-        # Note: TextRP uses bearer token authentication with non-expiring tokens
-        # Server config: expire_access_token: False
         self.textrp = TextRPChatbot(
             homeserver=config.textrp_homeserver,
             username=config.textrp_username,
-            access_token=config.textrp_access_token,
+            access_token=config.matrix_as_token,
             device_name=config.textrp_device_name,
             device_id=config.textrp_device_id or None,
             invalidate_token_on_shutdown=config.invalidate_token_on_shutdown
@@ -200,6 +239,8 @@ class TextRPBot:
         )
         
         # Initialize faucet database
+        faucet_db_file = Path(config.faucet_db_path)
+        faucet_db_file.parent.mkdir(parents=True, exist_ok=True)
         self.faucet_db = FaucetDB(config.faucet_db_path)
         
         # Initialize faucet wallet if configured
@@ -226,6 +267,10 @@ class TextRPBot:
         self._register_events()
         
         logger.info("TextRPBot initialized")
+
+    def request_shutdown(self) -> None:
+        """Signal background tasks and appservice runtime to stop."""
+        self._shutdown_event.set()
     
     def _register_events(self) -> None:
         """Register TextRP event handlers."""
@@ -246,6 +291,15 @@ class TextRPBot:
         @self.textrp.on_event(RoomMemberEvent)
         async def on_member_event(room, event):
             """Handle room member events — welcome new joiners."""
+            if (
+                event.membership == "invite"
+                and event.state_key == self.textrp.client.user_id
+            ):
+                logger.info(f"Accepting invite to room: {room.room_id}")
+                await self.textrp.join_room(room.room_id)
+                logger.info(f"Joined room: {room.room_id}")
+                return
+
             # Only act on join events for users other than the bot
             if event.membership != "join" or event.prev_membership == "join":
                 return
@@ -1367,40 +1421,43 @@ Each NFT you hold increases your daily faucet bonus. Don't miss out on extra tok
 
     async def start(self) -> None:
         """
-        Start the bot and begin processing events.
-        
-        This method:
-        1. Logs into TextRP
-        2. Optionally joins a default room
-        3. Starts the sync loop
-        4. Handles graceful shutdown
+        Start the bot in appservice mode and begin processing transactions.
         """
         logger.info("=" * 50)
-        logger.info("Starting TextRP Bot")
+        logger.info("Starting TextRP Bot (Synapse appservice mode)")
         logger.info("=" * 50)
         logger.info(f"Homeserver: {self.config.textrp_homeserver}")
         logger.info(f"Username: {self.config.textrp_username}")
+        logger.info(f"Appservice URL: {self.config.matrix_as_url}")
+        logger.info(
+            f"Appservice bind: {self.config.matrix_as_host}:{self.config.matrix_as_port}"
+        )
+        logger.info(f"Faucet DB path: {self.config.faucet_db_path}")
         logger.info(f"XRPL Network: {self.config.xrpl_network}")
         logger.info("=" * 50)
-        
-        # Login to TextRP
-        if not await self.textrp.login():
-            logger.error("Failed to login to TextRP. Exiting.")
-            return
-        
-        logger.info("Logged in to TextRP successfully")
-        
-        # Start sync loop with shutdown handling
-        logger.info("Starting sync loop. Press Ctrl+C to exit.")
-        
+
+        self.textrp.client.access_token = self.config.matrix_as_token
+        self.textrp.client.user_id = self.config.textrp_username
+
+        self.appservice_server = MatrixAppServiceServer(
+            host=self.config.matrix_as_host,
+            port=self.config.matrix_as_port,
+            hs_token=self.config.matrix_hs_token,
+            as_token=self.config.matrix_as_token,
+            as_id=self.config.matrix_as_id,
+            sender_localpart=self.config.matrix_as_sender_localpart,
+            event_callback=self.textrp.dispatch_appservice_events,
+        )
+
         # Start reminder task
         reminder_task = asyncio.create_task(self._reminder_loop())
         
         try:
-            # Run sync loop until shutdown
-            await self.textrp.sync_forever(timeout=30000)
+            await self.appservice_server.start()
+            logger.info("Appservice server started. Press Ctrl+C to exit.")
+            await self._shutdown_event.wait()
         except asyncio.CancelledError:
-            logger.info("Sync loop cancelled")
+            logger.info("Appservice runtime cancelled")
         finally:
             reminder_task.cancel()
             try:
@@ -1412,15 +1469,13 @@ Each NFT you hold increases your daily faucet bonus. Don't miss out on extra tok
     async def shutdown(self) -> None:
         """Gracefully shutdown the bot."""
         logger.info("Shutting down...")
+        self._shutdown_event.set()
         
-        # Stop the sync loop
-        self.textrp.stop_sync()
-        
-        # Logout and close
-        try:
-            await self.textrp.logout()
-        except Exception as e:
-            logger.warning(f"Error during logout: {e}")
+        if self.appservice_server is not None:
+            try:
+                await self.appservice_server.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping appservice server: {e}")
         
         try:
             await self.textrp.close()
@@ -1478,7 +1533,7 @@ def setup_signal_handlers(bot: TextRPBot, loop: asyncio.AbstractEventLoop) -> No
     """
     def signal_handler():
         logger.info("Received shutdown signal")
-        bot.textrp.stop_sync()
+        bot.request_shutdown()
     
     # Register signal handlers
     # Note: On Windows, only SIGINT is supported
