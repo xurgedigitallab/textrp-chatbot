@@ -49,11 +49,19 @@ cp .env.example .env
 Edit `.env` with your settings:
 
 ```env
-# TextRP Credentials
+# Matrix homeserver and appservice sender user
 TEXTRP_HOMESERVER=https://synapse.textrp.io
 TEXTRP_USERNAME=@yourbot:synapse.textrp.io
-# TextRP uses access tokens, not passwords
-TEXTRP_ACCESS_TOKEN=your_access_token
+
+# Appservice registration values
+MATRIX_AS_ID=textrp-bot
+MATRIX_AS_SENDER_LOCALPART=yourbot
+MATRIX_AS_TOKEN=replace_with_generated_appservice_token
+MATRIX_HS_TOKEN=replace_with_generated_homeserver_token
+MATRIX_AS_URL=https://bot.example.com
+MATRIX_AS_HOST=0.0.0.0
+MATRIX_AS_PORT=9009
+
 TEXTRP_DEVICE_NAME=TextRP Chatbot
 TEXTRP_ROOM_ID=!yourroomid:synapse.textrp.io
 
@@ -68,37 +76,50 @@ WEATHER_API_KEY=your_openweathermap_api_key
 # Bot Settings
 BOT_COMMAND_PREFIX=!
 BOT_LOG_LEVEL=INFO
-# Token invalidation on shutdown (false = token stays valid across restarts)
+# In appservice mode this should remain false
 INVALIDATE_TOKEN_ON_SHUTDOWN=false
 ```
 
-### 3. Get TextRP Access Token
+### 3. Configure Synapse Appservice Registration
 
-1. Click on your profile icon in the TextRP app
-2. Select **All settings**
-
-![Steps 1-2: Open settings](images/1-2.png)
-
-3. Click **Help & About** in the left sidebar
-4. Click **Access Token** to reveal and copy your token
-
-![Steps 3-4: Get access token](images/3-4.png)
-
-5. Add it to your `.env` file:
-   ```env
-   TEXTRP_ACCESS_TOKEN=your_actual_access_token_here
+1. Copy the registration template:
+   ```bash
+   cp synapse_appservice_registration.yaml.example synapse_appservice_registration.yaml
    ```
+2. Set `id`, `url`, `as_token`, `hs_token`, `sender_localpart`, and `namespaces.users[0].regex`.
+3. Make sure `url` points to your bot endpoint (for example, `https://bot.example.com`), and that your reverse proxy routes that domain to `MATRIX_AS_HOST:MATRIX_AS_PORT`.
+4. Add the registration file path to Synapse `homeserver.yaml`:
+   ```yaml
+   app_service_config_files:
+     - /path/to/synapse_appservice_registration.yaml
+   ```
+5. Restart Synapse.
 
-### 4. Run the Bot
+### 4. Run the Bot (Local Python)
 
 ```bash
 python main.py
 ```
 
 The bot will:
-- Connect to TextRP
+- Start an appservice HTTP listener
 - Automatically accept room invitations
 - Start responding to commands
+
+### 5. Run the Bot (Docker)
+
+Build and run with Docker Compose:
+
+```bash
+docker compose -f docker-compose.appservice.yml up --build -d
+```
+
+Or run directly:
+
+```bash
+docker build -t textrp-chatbot:appservice .
+docker run --rm -p 9009:9009 --env-file .env textrp-chatbot:appservice
+```
 
 ## Bot Commands
 
@@ -112,24 +133,23 @@ The bot will:
 | `!weather <location>` | Get current weather | `!weather New York` |
 | `!forecast <location>` | Get weather forecast | `!forecast 90210` |
 
-## TextRP Token Authentication
+## Synapse Appservice Mode
 
-TextRP uses bearer token authentication:
+This bot now runs in appservice-only mode:
 
-1. **Obtain Access Token**: Get your token from the TextRP dashboard
-   - Tokens start with `syt_` prefix
-   - Tokens do not expire (server configured with `expire_access_token: False`)
-   - Keep your token secure - it provides full access to your bot account
+- Synapse pushes room events to `PUT /_matrix/app/v1/transactions/{txnId}`.
+- The bot validates requests using `MATRIX_HS_TOKEN`.
+- The bot sends outbound Matrix client API calls using `MATRIX_AS_TOKEN`.
+- Existing command handlers continue to run through the same internal dispatch path.
 
-2. **Authentication Method**: 
-   - The bot uses bearer token authentication directly
-   - No password login or token refresh needed
-   - Token is validated via the `/whoami` endpoint on startup
+### DNS and TLS
 
-3. **Token Format**:
-   ```
-   TEXTRP_ACCESS_TOKEN=syt_cjliRk5xenRBcERWOWlGTTIzN0ZrRUhyQ1VtY1BndDV5eg_dbtiOrmdcyrKShXwgBFB_3ADm76
-   ```
+For production deployment:
+
+- publish a DNS record for your bot endpoint (for example `bot.example.com`)
+- terminate TLS at a reverse proxy (Nginx, Caddy, Traefik, or similar)
+- route `https://bot.example.com` to the container port `9009`
+- set `MATRIX_AS_URL` and registration `url` to the public HTTPS endpoint
 
 ## Room Methods
 
@@ -344,7 +364,13 @@ Create a bot account on TextRP.
 |----------|-------------|---------|
 | `TEXTRP_HOMESERVER` | TextRP server URL | `https://synapse.textrp.io` |
 | `TEXTRP_USERNAME` | Bot's TextRP user ID | Required |
-| `TEXTRP_ACCESS_TOKEN` | Bot's access token | Required |
+| `MATRIX_AS_ID` | Appservice ID in Synapse registration | Required |
+| `MATRIX_AS_SENDER_LOCALPART` | Sender localpart in registration | Required |
+| `MATRIX_AS_TOKEN` | Appservice outbound token | Required |
+| `MATRIX_HS_TOKEN` | Homeserver inbound token | Required |
+| `MATRIX_AS_URL` | Public appservice callback URL | Required |
+| `MATRIX_AS_HOST` | Local bind host for appservice HTTP server | `0.0.0.0` |
+| `MATRIX_AS_PORT` | Local bind port for appservice HTTP server | `9009` |
 | `TEXTRP_DEVICE_NAME` | Device display name | `TextRP Bot` |
 | `TEXTRP_ROOM_ID` | Default room to join | Optional |
 | `INVALIDATE_TOKEN_ON_SHUTDOWN` | Whether to invalidate token on shutdown (true/false) | `false` |
@@ -356,12 +382,7 @@ Create a bot account on TextRP.
 
 ### Token Invalidation on Shutdown
 
-The `INVALIDATE_TOKEN_ON_SHUTDOWN` flag controls whether the bot's access token is invalidated when the bot shuts down:
-
-- **`false` (default)**: Token remains valid across restarts. More convenient for development.
-- **`true`**: Token is invalidated on shutdown. More secure for production.
-
-**Note**: When set to `true`, you'll need to generate a new token each time the bot restarts.
+In appservice mode, keep `INVALIDATE_TOKEN_ON_SHUTDOWN=false`.
 
 ## Development
 

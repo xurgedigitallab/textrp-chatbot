@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  textrp-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: textrp-chatbot:appservice
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "9009:9009"
+    volumes:
+      - textrp_store:/app/textrp_store
+
+volumes:
+  textrp_store:

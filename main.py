@@ -18,8 +18,14 @@ Usage:
 
 Environment Variables:
     TEXTRP_HOMESERVER  - TextRP homeserver URL
-    TEXTRP_USERNAME    - Bot's TextRP user ID
-    TEXTRP_ACCESS_TOKEN - Bot's access token
+    TEXTRP_USERNAME    - Appservice sender user ID
+    MATRIX_AS_TOKEN    - Appservice token for outbound Matrix client API calls
+    MATRIX_HS_TOKEN    - Homeserver token for inbound appservice transactions
+    MATRIX_AS_HOST     - Host interface for appservice HTTP server
+    MATRIX_AS_PORT     - Port for appservice HTTP server
+    MATRIX_AS_URL      - Public URL Synapse calls for transactions
+    MATRIX_AS_ID       - Appservice ID (registration value)
+    MATRIX_AS_SENDER_LOCALPART - Sender localpart (registration value)
     TEXTRP_ROOM_ID     - Optional default room to join
     WEATHER_API_KEY    - OpenWeatherMap API key
     XRPL_NETWORK       - XRPL network (mainnet/testnet/devnet)
@@ -35,6 +41,7 @@ from typing import Optional
 from dotenv import load_dotenv
 
 # Import our modules
+from appservice_server import MatrixAppServiceServer
 from textrp_chatbot import TextRPChatbot
 from xrpl_utils import XRPLClient
 from weather_utils import WeatherClient, TemperatureUnit
@@ -82,9 +89,15 @@ class BotConfig:
             "TEXTRP_USERNAME",
             "@yourbot:synapse.textrp.io"
         )
-        self.textrp_access_token = os.getenv("TEXTRP_ACCESS_TOKEN", "")
         self.textrp_device_name = os.getenv("TEXTRP_DEVICE_NAME", "TextRP Bot")
         self.textrp_room_id = os.getenv("TEXTRP_ROOM_ID")
+        self.matrix_as_token = os.getenv("MATRIX_AS_TOKEN", "")
+        self.matrix_hs_token = os.getenv("MATRIX_HS_TOKEN", "")
+        self.matrix_as_host = os.getenv("MATRIX_AS_HOST", "0.0.0.0")
+        self.matrix_as_port = int(os.getenv("MATRIX_AS_PORT", "9009"))
+        self.matrix_as_url = os.getenv("MATRIX_AS_URL", "")
+        self.matrix_as_sender_localpart = os.getenv("MATRIX_AS_SENDER_LOCALPART", "")
+        self.matrix_as_id = os.getenv("MATRIX_AS_ID", "")
         
         # XRPL configuration
         self.xrpl_network = os.getenv("XRPL_NETWORK", "mainnet")
@@ -103,18 +116,30 @@ class BotConfig:
     
     def validate(self) -> bool:
         """Validate that required configuration is present."""
-        # TextRP requires access token (bearer token authentication)
-        if not self.textrp_access_token:
-            logger.error(
-                "TEXTRP_ACCESS_TOKEN is required for TextRP authentication"
-            )
-            return False
+        required_values = {
+            "MATRIX_AS_TOKEN": self.matrix_as_token,
+            "MATRIX_HS_TOKEN": self.matrix_hs_token,
+            "MATRIX_AS_URL": self.matrix_as_url,
+            "MATRIX_AS_SENDER_LOCALPART": self.matrix_as_sender_localpart,
+            "MATRIX_AS_ID": self.matrix_as_id,
+        }
+        for key, value in required_values.items():
+            if not value:
+                logger.error(f"{key} is required for appservice mode")
+                return False
         
         if self.textrp_username == "@yourbot:synapse.textrp.io":
             logger.warning(
                 "Using default TEXTRP_USERNAME. "
                 "Set TEXTRP_USERNAME environment variable."
             )
+
+        if not self.textrp_username.startswith("@") or ":" not in self.textrp_username:
+            logger.error(
+                "TEXTRP_USERNAME must be a full Matrix user ID, "
+                "for example @bot:your.domain"
+            )
+            return False
         
         if not self.weather_api_key:
             logger.warning(
@@ -152,14 +177,13 @@ class TextRPBot:
         """
         self.config = config
         self._shutdown_event = asyncio.Event()
+        self.appservice_server: Optional[MatrixAppServiceServer] = None
         
         # Initialize TextRP client
-        # Note: TextRP uses bearer token authentication with non-expiring tokens
-        # Server config: expire_access_token: False
         self.textrp = TextRPChatbot(
             homeserver=config.textrp_homeserver,
             username=config.textrp_username,
-            access_token=config.textrp_access_token,
+            access_token=config.matrix_as_token,
             device_name=config.textrp_device_name,
             invalidate_token_on_shutdown=config.invalidate_token_on_shutdown
         )
@@ -184,6 +208,10 @@ class TextRPBot:
         self._register_events()
         
         logger.info("TextRPBot initialized")
+
+    def request_shutdown(self) -> None:
+        """Signal the appservice runtime to stop."""
+        self._shutdown_event.set()
     
     def _register_events(self) -> None:
         """Register TextRP event handlers."""
@@ -204,8 +232,15 @@ class TextRPBot:
         @self.textrp.on_event(RoomMemberEvent)
         async def on_member_event(room, event):
             """Handle room member events."""
-            # This handles general member events
-            pass
+            # Appservice transactions commonly deliver invite membership
+            # updates as generic member events.
+            if (
+                getattr(event, "membership", None) == "invite"
+                and getattr(event, "state_key", None) == self.textrp.client.user_id
+            ):
+                logger.info(f"Accepting invite to room: {room.room_id}")
+                await self.textrp.join_room(room.room_id)
+                logger.info(f"Joined room: {room.room_id}")
         
         @self.textrp.on_event(InviteMemberEvent)
         async def on_invite(room, event):
@@ -977,53 +1012,53 @@ class TextRPBot:
     
     async def start(self) -> None:
         """
-        Start the bot and begin processing events.
-        
-        This method:
-        1. Logs into TextRP
-        2. Optionally joins a default room
-        3. Starts the sync loop
-        4. Handles graceful shutdown
+        Start the bot in appservice mode.
         """
         logger.info("=" * 50)
-        logger.info("Starting TextRP Bot")
+        logger.info("Starting TextRP Bot (Synapse appservice mode)")
         logger.info("=" * 50)
         logger.info(f"Homeserver: {self.config.textrp_homeserver}")
         logger.info(f"Username: {self.config.textrp_username}")
+        logger.info(f"Appservice URL: {self.config.matrix_as_url}")
+        logger.info(
+            f"Listening on: {self.config.matrix_as_host}:{self.config.matrix_as_port}"
+        )
         logger.info(f"XRPL Network: {self.config.xrpl_network}")
         logger.info("=" * 50)
-        
-        # Login to TextRP
-        if not await self.textrp.login():
-            logger.error("Failed to login to TextRP. Exiting.")
-            return
-        
-        logger.info("Logged in to TextRP successfully")
-        
-        # Start sync loop with shutdown handling
-        logger.info("Starting sync loop. Press Ctrl+C to exit.")
-        
+
+        # Configure the nio client for appservice auth.
+        self.textrp.client.access_token = self.config.matrix_as_token
+        self.textrp.client.user_id = self.config.textrp_username
+
+        self.appservice_server = MatrixAppServiceServer(
+            host=self.config.matrix_as_host,
+            port=self.config.matrix_as_port,
+            hs_token=self.config.matrix_hs_token,
+            as_token=self.config.matrix_as_token,
+            as_id=self.config.matrix_as_id,
+            sender_localpart=self.config.matrix_as_sender_localpart,
+            event_callback=self.textrp.dispatch_appservice_events,
+        )
+
         try:
-            # Run sync loop until shutdown
-            await self.textrp.sync_forever(timeout=30000)
+            await self.appservice_server.start()
+            logger.info("Appservice server started. Press Ctrl+C to exit.")
+            await self._shutdown_event.wait()
         except asyncio.CancelledError:
-            logger.info("Sync loop cancelled")
+            logger.info("Appservice runtime cancelled")
         finally:
             await self.shutdown()
     
     async def shutdown(self) -> None:
         """Gracefully shutdown the bot."""
         logger.info("Shutting down...")
-        
-        # Stop the sync loop
-        self.textrp.stop_sync()
-        
-        # Logout and close
-        try:
-            await self.textrp.logout()
-        except Exception as e:
-            logger.warning(f"Error during logout: {e}")
-        
+
+        if self.appservice_server is not None:
+            try:
+                await self.appservice_server.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping appservice server: {e}")
+
         try:
             await self.textrp.close()
         except Exception as e:
@@ -1044,7 +1079,7 @@ def setup_signal_handlers(bot: TextRPBot, loop: asyncio.AbstractEventLoop) -> No
     """
     def signal_handler():
         logger.info("Received shutdown signal")
-        bot.textrp.stop_sync()
+        bot.request_shutdown()
     
     # Register signal handlers
     # Note: On Windows, only SIGINT is supported

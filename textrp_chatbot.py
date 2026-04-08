@@ -26,6 +26,7 @@ import logging
 import os
 from typing import Optional, List, Dict, Any, Callable, Union
 from datetime import datetime
+from types import SimpleNamespace
 
 from nio import (
     # Client classes
@@ -1686,6 +1687,72 @@ class TextRPChatbot:
                     room.room_id,
                     f"Error executing command: {str(e)}"
                 )
+
+    async def dispatch_appservice_events(self, events: List[Dict[str, Any]]) -> int:
+        """
+        Dispatch Synapse appservice transaction events through the existing
+        event/command processing path.
+
+        Args:
+            events: Raw event dictionaries from a transaction payload.
+
+        Returns:
+            int: Number of events processed.
+        """
+        if not events:
+            return 0
+
+        events_by_room: Dict[str, List[Dict[str, Any]]] = {}
+        for event in events:
+            room_id = event.get("room_id")
+            if not room_id:
+                continue
+            events_by_room.setdefault(room_id, []).append(event)
+
+        processed = 0
+
+        for room_id, room_events in events_by_room.items():
+            sync_payload = {
+                "next_batch": "appservice-transaction",
+                "rooms": {
+                    "join": {
+                        room_id: {
+                            "summary": {},
+                            "state": {"events": []},
+                            "timeline": {
+                                "events": room_events,
+                                "limited": False,
+                                "prev_batch": "appservice-transaction",
+                            },
+                            "ephemeral": {"events": []},
+                            "account_data": {"events": []},
+                            "unread_notifications": {},
+                        }
+                    }
+                },
+            }
+
+            parsed_response = SyncResponse.from_dict(sync_payload)
+            if isinstance(parsed_response, SyncError):
+                logger.error(
+                    f"Failed to parse appservice transaction events for {room_id}: "
+                    f"{parsed_response.message}"
+                )
+                continue
+
+            joined_room_info = parsed_response.rooms.join.get(room_id)
+            if joined_room_info is None:
+                continue
+
+            room = self.client.rooms.get(room_id)
+            if room is None:
+                room = SimpleNamespace(room_id=room_id, display_name=room_id)
+
+            for parsed_event in joined_room_info.timeline.events:
+                await self._process_event(room, parsed_event)
+                processed += 1
+
+        return processed
     
     # =========================================================================
     # SYNC AND MAIN LOOP

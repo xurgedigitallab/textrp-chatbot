@@ -1,0 +1,17 @@
+.git
+.gitignore
+.cursor
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+build/
+dist/
+.env
+.env.*
+textrp_store/

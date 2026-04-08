@@ -1,0 +1,13 @@
+id: textrp-bot
+url: https://faucetbot.textrp.io
+as_token: replace_with_generated_appservice_token
+hs_token: replace_with_generated_homeserver_token
+sender_localpart: yourbot
+rate_limited: false
+
+namespaces:
+  users:
+    - exclusive: true
+      regex: "@r9bFNqztApDV9iFM237FkEHrCUmcPgt5yz:synapse.textrp.io"
+  aliases: []
+  rooms: []
