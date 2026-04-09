@@ -1,6 +1,7 @@
 # Environment and secrets
 .env
 .env.local
+secrets/*.txt
 config_local.yaml
 
 # Python

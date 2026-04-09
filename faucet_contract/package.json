@@ -1,0 +1,16 @@
+{
+    "name": "faucet_contract",
+    "version": "1.0.0",
+    "scripts": {
+        "build": "npx ncc build src/contract.js -o dist",
+        "build:prod": "npx ncc build src/contract.js --minify -o dist",
+        "build:hp": "docker run --rm -u $(id -u):$(id -g) -v \"$PWD\":/app -w /app node:20-bullseye bash -lc \"npm ci && npm run build\"",
+        "start": "npm run build && hpdevkit deploy dist",
+        "start:hp": "npm run build:hp && hpdevkit deploy dist"
+    },
+    "dependencies": {
+        "@vercel/ncc": "0.34.0",
+        "better-sqlite3": "^12.8.0",
+        "hotpocket-nodejs-contract": "^0.7.3"
+    }
+}

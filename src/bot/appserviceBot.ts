@@ -9,7 +9,8 @@ import * as xrpl from "xrpl";
 
 import type { BotConfig } from "../config.js";
 import { CommandRouter } from "./commandRouter.js";
-import { FaucetStore } from "../services/faucetStore.js";
+import { ContractStoreClient } from "../services/contractStoreClient.js";
+import type { FaucetStateStore } from "../services/faucetStateStore.js";
 import { XRPL_UNIX_EPOCH_OFFSET, XrplService } from "../services/xrplClient.js";
 
 interface RoomMemberRecord {
@@ -20,7 +21,8 @@ interface RoomMemberRecord {
 export class AppserviceBot {
   private readonly config: BotConfig;
   private readonly xrpl: XrplService;
-  private readonly faucetStore: FaucetStore;
+  private readonly faucetStore: FaucetStateStore;
+  private readonly contractStoreClient: ContractStoreClient;
   private readonly appservice: Appservice;
   private readonly commandRouter: CommandRouter;
   private readonly knownMembership = new Map<string, Set<string>>();
@@ -35,11 +37,12 @@ export class AppserviceBot {
       lpInfo: config.lpInfo,
     });
 
-    this.faucetStore = new FaucetStore({
-      dbPath: config.faucetDbPath,
+    this.contractStoreClient = new ContractStoreClient({
+      servers: config.hpContractServers,
+      timeoutMs: config.hpContractTimeoutMs,
       cooldownHours: config.faucetCooldownHours,
-      epochProvider: async () => this.getDeterministicEpoch(),
     });
+    this.faucetStore = this.contractStoreClient;
 
     const usernameParts = config.textrpUsername.split(":");
     const homeserverName = usernameParts.length > 1 ? usernameParts[1] : "";
@@ -80,6 +83,7 @@ export class AppserviceBot {
       faucetWalletSeed: config.faucetWalletSeed,
       faucetStore: this.faucetStore,
       xrpl: this.xrpl,
+      getDeterministicEpoch: async () => this.getDeterministicEpoch(),
       sendMessage: async (roomId, body) => {
         const client = this.appservice.botIntent.underlyingClient;
         await client.sendMessage(roomId, { msgtype: "m.text", body });
@@ -185,6 +189,7 @@ export class AppserviceBot {
 
   async start(): Promise<void> {
     await this.xrpl.connect();
+    await this.contractStoreClient.start();
     await this.appservice.begin();
     this.startReminderLoop();
   }
@@ -193,6 +198,7 @@ export class AppserviceBot {
     this.stopping = true;
     if (this.reminderTimer) clearInterval(this.reminderTimer);
     await this.xrpl.disconnect();
+    await this.contractStoreClient.stop();
     await this.appservice.stop();
   }
 

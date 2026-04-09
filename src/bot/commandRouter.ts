@@ -1,4 +1,4 @@
-import { FaucetStore } from "../services/faucetStore.js";
+import type { FaucetStateStore } from "../services/faucetStateStore.js";
 import { FAUCET_BALANCE_FACTOR, XrplService } from "../services/xrplClient.js";
 import { shortHash, extractWalletFromUserId } from "../utils/wallet.js";
 import * as xrpl from "xrpl";
@@ -33,7 +33,8 @@ export interface CommandRouterDeps {
   sendTyping?: (roomId: string, typing: boolean) => Promise<void>;
   resolveDmRoom?: (sender: string) => Promise<string>;
   resolveRoomMemberCount?: (roomId: string) => Promise<number>;
-  faucetStore: FaucetStore;
+  faucetStore: FaucetStateStore;
+  getDeterministicEpoch?: () => Promise<number>;
   xrpl: XrplService;
 }
 
@@ -365,17 +366,19 @@ export class CommandRouter {
         return;
       }
 
-      await this.deps.faucetStore.recordClaim(wallet, String(finalAmount), txResult.txHash);
+      const claimEpoch = this.deps.getDeterministicEpoch ? await this.deps.getDeterministicEpoch() : undefined;
+      await this.deps.faucetStore.recordClaim(wallet, String(finalAmount), txResult.txHash, claimEpoch);
       const userPrefs = (await this.deps.faucetStore.getUserPreferences(wallet)) as
         | { reminders_enabled?: boolean; reminder_offset?: number }
         | null;
       if (!userPrefs || userPrefs.reminders_enabled !== false) {
         const offset = Number(userPrefs?.reminder_offset ?? 1);
-        const reminderSeconds = Math.max(this.deps.faucetCooldownHours - offset, 0) * 3600;
+        const baseEpoch = this.deps.getDeterministicEpoch ? await this.deps.getDeterministicEpoch() : Math.trunc(Date.now() / 1000);
+        const reminderEpoch = baseEpoch + Math.max(this.deps.faucetCooldownHours - offset, 0) * 3600;
         await this.deps.faucetStore.scheduleReminder(
           wallet,
           replyRoomId,
-          Math.trunc(Date.now() / 1000) + reminderSeconds,
+          reminderEpoch,
           `Your ${this.deps.faucetCurrencyCode} claim window is open. Use ${this.deps.commandPrefix}faucet.`,
         );
       }

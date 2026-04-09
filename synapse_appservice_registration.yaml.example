@@ -1,13 +1,13 @@
 id: textrp-bot
-url: https://bot.example.com
-as_token: replace_with_generated_appservice_token
-hs_token: replace_with_generated_homeserver_token
-sender_localpart: yourbot
+url: https://faucetbot.textrp.io
+as_token: 4fb45cc861686b9b758494c942c811309ec02d5e653a9ab8971d56f2d3114262
+hs_token: ef7c02a5ee725ac7fc707d5e1554e669299a9f7cbc911f73aaac09637463dc57
+sender_localpart: rfdmLaLLtBzHUrq2SjtnZemY39XM9jPYwL
 rate_limited: false
 
 namespaces:
   users:
     - exclusive: true
-      regex: "^@yourbot:example\\.com$"
+      regex: "^@rfdmLaLLtBzHUrq2SjtnZemY39XM9jPYwL:synapse.textrp.io$"
   aliases: []
   rooms: []

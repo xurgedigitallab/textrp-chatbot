@@ -1,6 +1,6 @@
 # TextRP Faucet Bot (JavaScript Appservice)
 
-This repository now runs as a **JavaScript/TypeScript Matrix appservice** using [`matrix-bot-sdk`](https://turt2live.github.io/matrix-bot-sdk/tutorial-appservice_.html), with XRPL faucet and JSON state persistence under `HP_STATE_DIR`.
+This repository now runs as a **JavaScript/TypeScript Matrix appservice** using [`matrix-bot-sdk`](https://turt2live.github.io/matrix-bot-sdk/tutorial-appservice_.html), with XRPL faucet state managed through HotPocket contract RPC.
 
 ## Runtime Overview
 
@@ -78,8 +78,8 @@ npm start
 - `FAUCET_COOLDOWN_HOURS`
 - `FAUCET_MIN_XRP_BALANCE`
 - `TOKEN_ISSUER`
-- `HP_STATE_DIR` (default `/hp/state`)
-- `FAUCET_DB_PATH` (`HP_STATE_DIR`-aware path resolution)
+- `HP_CONTRACT_SERVERS` (comma-separated `wss://` endpoints)
+- `HP_CONTRACT_TIMEOUT_MS` (default `15000`)
 - `LP_INFO` (`issuer:taxon,issuer:taxon`)
 
 ## Matrix Appservice Registration
@@ -127,8 +127,56 @@ Under the resolved faucet storage directory:
 Build and run with compose:
 
 ```bash
-docker compose -f docker-compose.appservice.yml up --build -d
+docker compose up --build -d
 ```
+
+The appservice binds on `127.0.0.1:9009` by default in compose so it can be safely exposed through an HTTPS reverse proxy.
+
+## NGINX + SSL (faucetbot.textrp.io)
+
+1. Ensure DNS `A`/`AAAA` records for `faucetbot.textrp.io` point to this server.
+2. Start the bot container:
+
+```bash
+docker compose up -d --build
+```
+
+3. Install NGINX + Certbot:
+
+```bash
+sudo apt update
+sudo apt install -y nginx certbot python3-certbot-nginx
+```
+
+4. Install the provided bootstrap NGINX site config (HTTP-only; safe before certificate exists):
+
+```bash
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo cp deploy/nginx/faucetbot.textrp.io.conf /etc/nginx/sites-available/faucetbot.textrp.io
+sudo ln -s /etc/nginx/sites-available/faucetbot.textrp.io /etc/nginx/sites-enabled/faucetbot.textrp.io
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+5. Issue and install the TLS certificate:
+
+```bash
+sudo certbot --nginx -d faucetbot.textrp.io
+```
+
+6. Verify from the server:
+
+```bash
+curl -I https://faucetbot.textrp.io
+```
+
+If DNS is not propagated yet, `certbot` will fail. Verify first:
+
+```bash
+dig +short faucetbot.textrp.io
+```
+
+Make sure your Synapse appservice registration `url` is set to `https://faucetbot.textrp.io`.
 
 ## Tests
 

@@ -1,4 +1,4 @@
-import path from "node:path";
+import { readFileSync } from "node:fs";
 
 export interface BotConfig {
   textrpHomeserver: string;
@@ -21,8 +21,8 @@ export interface BotConfig {
   faucetColdWallet: string;
   tokenIssuer: string;
   faucetAdminUsers: string[];
-  hpStateDir: string;
-  faucetDbPath: string;
+  hpContractServers: string[];
+  hpContractTimeoutMs: number;
   commandPrefix: string;
   logLevel: string;
   invalidateTokenOnShutdown: boolean;
@@ -54,21 +54,36 @@ const asFloat = (value: string | undefined, fallback: number): number => {
   return Number.isNaN(parsed) ? fallback : parsed;
 };
 
-function resolveFaucetDbPath(rawPath: string, hpStateDir: string): string {
-  if (path.isAbsolute(rawPath)) return rawPath;
-  return path.join(hpStateDir, "faucet.db");
-}
+const asList = (value: string | undefined, fallback: string[]): string[] => {
+  if (!value) return fallback;
+  const list = value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return list.length > 0 ? list : fallback;
+};
+
+const envOrFile = (env: NodeJS.ProcessEnv, key: string): string => {
+  const direct = env[key];
+  if (direct) return direct;
+
+  const filePath = env[`${key}_FILE`];
+  if (!filePath) return "";
+
+  try {
+    return readFileSync(filePath, "utf8").trim();
+  } catch {
+    return "";
+  }
+};
 
 export function loadConfig(env = process.env): BotConfig {
-  const hpStateDir = env.HP_STATE_DIR ?? "/hp/state";
-  const faucetDbPath = resolveFaucetDbPath(env.FAUCET_DB_PATH ?? "faucet.db", hpStateDir);
-
   return {
     textrpHomeserver: env.TEXTRP_HOMESERVER ?? "https://synapse.textrp.io",
     textrpUsername: env.TEXTRP_USERNAME ?? "@yourbot:synapse.textrp.io",
     textrpRoomId: env.TEXTRP_ROOM_ID,
-    matrixAsToken: env.MATRIX_AS_TOKEN ?? "",
-    matrixHsToken: env.MATRIX_HS_TOKEN ?? "",
+    matrixAsToken: envOrFile(env, "MATRIX_AS_TOKEN"),
+    matrixHsToken: envOrFile(env, "MATRIX_HS_TOKEN"),
     matrixAsUrl: env.MATRIX_AS_URL ?? "",
     matrixAsHost: env.MATRIX_AS_HOST ?? "0.0.0.0",
     matrixAsPort: asInt(env.MATRIX_AS_PORT, 9009),
@@ -87,8 +102,8 @@ export function loadConfig(env = process.env): BotConfig {
       .split(",")
       .map((v) => v.trim())
       .filter(Boolean),
-    hpStateDir,
-    faucetDbPath,
+    hpContractServers: asList(env.HP_CONTRACT_SERVERS, ["wss://localhost:8081","wss://localhost:8082","wss://localhost:8083"]),
+    hpContractTimeoutMs: asInt(env.HP_CONTRACT_TIMEOUT_MS, 15000),
     commandPrefix: env.BOT_COMMAND_PREFIX ?? "!",
     logLevel: env.BOT_LOG_LEVEL ?? "info",
     invalidateTokenOnShutdown: asBool(env.INVALIDATE_TOKEN_ON_SHUTDOWN, false),

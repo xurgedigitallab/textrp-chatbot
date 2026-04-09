@@ -1,0 +1,48 @@
+services:
+  textrp-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: textrp-chatbot:appservice
+    restart: unless-stopped
+    environment:
+      TEXTRP_HOMESERVER: ${TEXTRP_HOMESERVER:-https://synapse.textrp.io}
+      TEXTRP_USERNAME: ${TEXTRP_USERNAME:-@yourbot:synapse.textrp.io}
+      TEXTRP_ROOM_ID: ${TEXTRP_ROOM_ID:-}
+      MATRIX_AS_TOKEN_FILE: /run/secrets/matrix_as_token
+      MATRIX_HS_TOKEN_FILE: /run/secrets/matrix_hs_token
+      MATRIX_AS_URL: ${MATRIX_AS_URL:-https://faucetbot.textrp.io}
+      MATRIX_AS_HOST: ${MATRIX_AS_HOST:-0.0.0.0}
+      MATRIX_AS_PORT: ${MATRIX_AS_PORT:-9009}
+      MATRIX_AS_ID: ${MATRIX_AS_ID:-textrp-bot}
+      MATRIX_AS_SENDER_LOCALPART: ${MATRIX_AS_SENDER_LOCALPART:-yourbot}
+      XRPL_NETWORK: ${XRPL_NETWORK:-mainnet}
+      XRPL_RPC_URL: ${XRPL_RPC_URL:-}
+      FAUCET_WALLET_SEED: /run/secrets/faucet_wallet_seed
+      FAUCET_CURRENCY_CODE: ${FAUCET_CURRENCY_CODE:-TXT}
+      FAUCET_DAILY_AMOUNT: ${FAUCET_DAILY_AMOUNT:-100}
+      FAUCET_COOLDOWN_HOURS: ${FAUCET_COOLDOWN_HOURS:-24}
+      FAUCET_MIN_XRP_BALANCE: ${FAUCET_MIN_XRP_BALANCE:-0.1}
+      FAUCET_COLD_WALLET: ${FAUCET_COLD_WALLET:-}
+      TOKEN_ISSUER: ${TOKEN_ISSUER:-}
+      FAUCET_ADMIN_USERS: ${FAUCET_ADMIN_USERS:-}
+      HP_CONTRACT_SERVERS: ${HP_CONTRACT_SERVERS:-wss://host.docker.internal:8081,wss://host.docker.internal:8082,wss://host.docker.internal:8083}
+      HP_CONTRACT_TIMEOUT_MS: ${HP_CONTRACT_TIMEOUT_MS:-15000}
+      LP_INFO: ${LP_INFO:-}
+      BOT_COMMAND_PREFIX: ${BOT_COMMAND_PREFIX:-!}
+      BOT_LOG_LEVEL: ${BOT_LOG_LEVEL:-info}
+      INVALIDATE_TOKEN_ON_SHUTDOWN: ${INVALIDATE_TOKEN_ON_SHUTDOWN:-false}
+    secrets:
+      - matrix_as_token
+      - matrix_hs_token
+      - faucet_wallet_seed
+    ports:
+      - "127.0.0.1:9009:9009"
+
+secrets:
+  matrix_as_token:
+    file: ./secrets/matrix_as_token.txt
+  matrix_hs_token:
+    file: ./secrets/matrix_hs_token.txt
+  faucet_wallet_seed:
+    file: ./secrets/faucet_wallet_seed.txt
