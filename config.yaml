@@ -4,13 +4,13 @@
 # TextRP Homeserver Configuration
 textrp_connection:
   homeserver: "https://synapse.textrp.io"  # TextRP homeserver
-  username: "@rfdmLaLLtBzHUrq2SjtnZemY39XM9jPYwL:synapse.textrp.io"   # Bot's TextRP ID
-  device_name: "TextRP Chatbot"     # Device display name
-  room_id: "!yourroomid:synapse.textrp.io" # Default room to join
+  username: "@r9bFNqztApDV9iFM237FkEHrCUmcPgt5yz:synapse.textrp.io"   # Bot's TextRP ID
+  device_name: "Farah Faucet Bot"     # Device display name
+  room_id: "!farah-faucet:synapse.textrp.io" # Default room to join
 
 # TextRP Configuration
 textrp:
-  server_url: "https://api.textrp.com"  # TextRP API endpoint
+  server_url: "https://backend.textrp.io"  # TextRP API endpoint
 
 # XRPL Configuration
 xrpl:

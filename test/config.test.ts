@@ -3,6 +3,11 @@ import { describe, expect, it } from "vitest";
 import { loadConfig, validateConfig } from "../src/config.js";
 
 describe("config", () => {
+  it("defaults contract servers to single hpdevkit endpoint", () => {
+    const cfg = loadConfig({} as NodeJS.ProcessEnv);
+    expect(cfg.hpContractServers).toEqual(["wss://localhost:8081"]);
+  });
+
   it("loads contract server settings", () => {
     const cfg = loadConfig({
       HP_CONTRACT_SERVERS: "wss://a.example,wss://b.example",

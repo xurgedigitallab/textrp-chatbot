@@ -77,11 +77,17 @@ const envOrFile = (env: NodeJS.ProcessEnv, key: string): string => {
   }
 };
 
+const optionalEnv = (value: string | undefined): string | undefined => {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+};
+
 export function loadConfig(env = process.env): BotConfig {
   return {
     textrpHomeserver: env.TEXTRP_HOMESERVER ?? "https://synapse.textrp.io",
     textrpUsername: env.TEXTRP_USERNAME ?? "@yourbot:synapse.textrp.io",
-    textrpRoomId: env.TEXTRP_ROOM_ID,
+    textrpRoomId: optionalEnv(env.TEXTRP_ROOM_ID),
     matrixAsToken: envOrFile(env, "MATRIX_AS_TOKEN"),
     matrixHsToken: envOrFile(env, "MATRIX_HS_TOKEN"),
     matrixAsUrl: env.MATRIX_AS_URL ?? "",
@@ -90,8 +96,8 @@ export function loadConfig(env = process.env): BotConfig {
     matrixAsId: env.MATRIX_AS_ID ?? "",
     matrixAsSenderLocalpart: env.MATRIX_AS_SENDER_LOCALPART ?? "",
     xrplNetwork: env.XRPL_NETWORK ?? "mainnet",
-    xrplRpcUrl: env.XRPL_RPC_URL,
-    faucetWalletSeed: env.FAUCET_WALLET_SEED ?? env.FAUCET_HOT_WALLET_SEED ?? "",
+    xrplRpcUrl: optionalEnv(env.XRPL_RPC_URL),
+    faucetWalletSeed: envOrFile(env, "FAUCET_WALLET_SEED") || env.FAUCET_HOT_WALLET_SEED || "",
     faucetCurrencyCode: env.FAUCET_CURRENCY_CODE ?? "TXT",
     faucetDailyAmount: asFloat(env.FAUCET_DAILY_AMOUNT, 100),
     faucetCooldownHours: asInt(env.FAUCET_COOLDOWN_HOURS ?? env.FAUCET_CLAIM_COOLDOWN_HOURS, 24),
@@ -102,7 +108,7 @@ export function loadConfig(env = process.env): BotConfig {
       .split(",")
       .map((v) => v.trim())
       .filter(Boolean),
-    hpContractServers: asList(env.HP_CONTRACT_SERVERS, ["wss://localhost:8081","wss://localhost:8082","wss://localhost:8083"]),
+    hpContractServers: asList(env.HP_CONTRACT_SERVERS, ["wss://localhost:8081"]),
     hpContractTimeoutMs: asInt(env.HP_CONTRACT_TIMEOUT_MS, 15000),
     commandPrefix: env.BOT_COMMAND_PREFIX ?? "!",
     logLevel: env.BOT_LOG_LEVEL ?? "info",
@@ -116,7 +122,6 @@ export function validateConfig(config: BotConfig): { ok: true } | { ok: false; e
   for (const key of REQUIRED_ENV) {
     const field = key
       .toLowerCase()
-      .replace(/^matrix_/, "matrix")
       .replace(/_([a-z])/g, (_, c) => c.toUpperCase()) as keyof BotConfig;
     if (!config[field]) {
       errors.push(`${key} is required for appservice mode`);

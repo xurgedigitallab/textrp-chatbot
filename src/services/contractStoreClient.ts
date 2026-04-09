@@ -24,11 +24,13 @@ type ContractOutputEvent = {
   ledgerSeqNo?: number;
 };
 
+type HotPocketClient = Awaited<ReturnType<typeof HotPocket.createClient>>;
+
 export class ContractStoreClient implements FaucetStateStore {
   private readonly servers: string[];
   private readonly timeoutMs: number;
   private readonly cooldownHours: number;
-  private client?: Awaited<ReturnType<typeof HotPocket.createClient>>;
+  private client?: HotPocketClient;
   private readonly pending = new Map<string, (response: RpcResponse) => void>();
   private connected = false;
 
@@ -40,9 +42,46 @@ export class ContractStoreClient implements FaucetStateStore {
 
   async start(): Promise<void> {
     if (this.connected) return;
+    if (this.servers.length === 0) {
+      throw new Error("No HotPocket contract servers configured");
+    }
+
     const keyPair = await HotPocket.generateKeys();
-    this.client = await HotPocket.createClient(this.servers, keyPair);
-    this.client.on(HotPocket.events.contractOutput, (event: ContractOutputEvent) => {
+    const connectionAttempts = [this.servers, ...this.servers.map((server) => [server])];
+    const seen = new Set<string>();
+    const errors: string[] = [];
+
+    for (const attemptServers of connectionAttempts) {
+      const attemptKey = attemptServers.join(",");
+      if (seen.has(attemptKey)) continue;
+      seen.add(attemptKey);
+
+      let attemptClient: HotPocketClient | undefined;
+      try {
+        attemptClient = await HotPocket.createClient(attemptServers, keyPair);
+        this.attachClientHandlers(attemptClient);
+        const connected = await attemptClient.connect();
+        if (connected) {
+          this.client = attemptClient;
+          this.connected = true;
+          return;
+        }
+        errors.push(`[${attemptKey}] connect() returned false`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        errors.push(`[${attemptKey}] ${message}`);
+      } finally {
+        if (attemptClient && !this.connected) {
+          attemptClient.close();
+        }
+      }
+    }
+
+    throw new Error(`Failed to connect to HotPocket contract. Attempts: ${errors.join("; ")}`);
+  }
+
+  private attachClientHandlers(client: HotPocketClient): void {
+    client.on(HotPocket.events.contractOutput, (event: ContractOutputEvent) => {
       for (const output of event.outputs ?? []) {
         if (output && typeof output.id === "string") {
           const resolver = this.pending.get(output.id);
@@ -53,7 +92,8 @@ export class ContractStoreClient implements FaucetStateStore {
         }
       }
     });
-    this.client.on(HotPocket.events.disconnect, () => {
+
+    client.on(HotPocket.events.disconnect, () => {
       this.connected = false;
       for (const [, resolver] of this.pending) {
         resolver({
@@ -66,11 +106,6 @@ export class ContractStoreClient implements FaucetStateStore {
       }
       this.pending.clear();
     });
-    const connected = await this.client.connect();
-    if (!connected) {
-      throw new Error("Failed to connect to HotPocket contract");
-    }
-    this.connected = true;
   }
 
   async stop(): Promise<void> {
