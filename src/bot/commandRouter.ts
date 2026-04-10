@@ -1,6 +1,7 @@
 import type { FaucetStateStore } from "../services/faucetStateStore.js";
 import { FAUCET_BALANCE_FACTOR, XrplService } from "../services/xrplClient.js";
 import { shortHash, extractWalletFromUserId } from "../utils/wallet.js";
+import { FaucetCoreService } from "../domain/faucetCoreService.js";
 import * as xrpl from "xrpl";
 
 type CommandHandler = (context: CommandContext) => Promise<void>;
@@ -36,6 +37,8 @@ export interface CommandRouterDeps {
   faucetStore: FaucetStateStore;
   getDeterministicEpoch?: () => Promise<number>;
   xrpl: XrplService;
+  faucetCore?: FaucetCoreService;
+  resolveWalletForSender?: (sender: string) => Promise<string | null>;
 }
 
 export class CommandRouter {
@@ -122,7 +125,7 @@ export class CommandRouter {
     });
 
     this.register("whoami", async ({ sender, replyRoomId }) => {
-      const wallet = extractWalletFromUserId(sender);
+      const wallet = await this.resolveWallet(sender);
       await this.deps.sendMessage(
         replyRoomId,
         `TextRP ID: \`${sender}\`\nWallet: \`${wallet ?? "Not detected"}\``,
@@ -130,7 +133,7 @@ export class CommandRouter {
     });
 
     this.register("balance", async ({ sender, replyRoomId }) => {
-      const wallet = extractWalletFromUserId(sender);
+      const wallet = await this.resolveWallet(sender);
       if (!wallet) {
         await this.deps.sendMessage(replyRoomId, "Could not extract your XRPL wallet from your Matrix ID.");
         return;
@@ -157,7 +160,7 @@ export class CommandRouter {
     });
 
     this.register("tokens", async ({ sender, replyRoomId }) => {
-      const wallet = extractWalletFromUserId(sender);
+      const wallet = await this.resolveWallet(sender);
       if (!wallet) {
         await this.deps.sendMessage(replyRoomId, "Could not extract your XRPL wallet from your Matrix ID.");
         return;
@@ -176,7 +179,7 @@ export class CommandRouter {
     });
 
     this.register("trust", async ({ sender, replyRoomId }) => {
-      const wallet = extractWalletFromUserId(sender);
+      const wallet = await this.resolveWallet(sender);
       if (!wallet) {
         await this.deps.sendMessage(replyRoomId, "Could not extract your XRPL wallet from your Matrix ID.");
         return;
@@ -196,7 +199,7 @@ export class CommandRouter {
     });
 
     this.register("trustdebug", async ({ sender, replyRoomId }) => {
-      const wallet = extractWalletFromUserId(sender);
+      const wallet = await this.resolveWallet(sender);
       if (!wallet) {
         await this.deps.sendMessage(replyRoomId, "Could not extract your XRPL wallet from your Matrix ID.");
         return;
@@ -211,7 +214,7 @@ export class CommandRouter {
     });
 
     this.register("lp", async ({ sender, replyRoomId }) => {
-      const wallet = extractWalletFromUserId(sender);
+      const wallet = await this.resolveWallet(sender);
       if (!wallet) {
         await this.deps.sendMessage(replyRoomId, "Could not extract your XRPL wallet from your Matrix ID.");
         return;
@@ -238,12 +241,14 @@ export class CommandRouter {
     });
 
     this.register("history", async ({ sender, replyRoomId }) => {
-      const wallet = extractWalletFromUserId(sender);
+      const wallet = await this.resolveWallet(sender);
       if (!wallet) {
         await this.deps.sendMessage(replyRoomId, "Could not extract your XRPL wallet from your Matrix ID.");
         return;
       }
-      const history = await this.deps.faucetStore.getUserClaimHistory(wallet);
+      const history = this.deps.faucetCore
+        ? await this.deps.faucetCore.getClaimHistory(wallet)
+        : await this.deps.faucetStore.getUserClaimHistory(wallet);
       if (history.length === 0) {
         await this.deps.sendMessage(replyRoomId, "No faucet claim history found.");
         return;
@@ -258,7 +263,7 @@ export class CommandRouter {
     });
 
     this.register("reminders", async ({ sender, args, replyRoomId }) => {
-      const wallet = extractWalletFromUserId(sender);
+      const wallet = await this.resolveWallet(sender);
       if (!wallet) {
         await this.deps.sendMessage(replyRoomId, "Could not extract your XRPL wallet from your Matrix ID.");
         return;
@@ -277,19 +282,31 @@ export class CommandRouter {
         return;
       }
       if (normalized === "on") {
-        await this.deps.faucetStore.setUserPreferences(wallet, { reminders_enabled: true });
+        if (this.deps.faucetCore) {
+          await this.deps.faucetCore.setReminderPreferences(wallet, { reminders_enabled: true });
+        } else {
+          await this.deps.faucetStore.setUserPreferences(wallet, { reminders_enabled: true });
+        }
         await this.deps.sendMessage(replyRoomId, "Reminders enabled.");
         return;
       }
       if (normalized === "off") {
-        await this.deps.faucetStore.setUserPreferences(wallet, { reminders_enabled: false });
+        if (this.deps.faucetCore) {
+          await this.deps.faucetCore.setReminderPreferences(wallet, { reminders_enabled: false });
+        } else {
+          await this.deps.faucetStore.setUserPreferences(wallet, { reminders_enabled: false });
+        }
         await this.deps.sendMessage(replyRoomId, "Reminders disabled.");
         return;
       }
       if (normalized.startsWith("set ")) {
         const offset = Number.parseInt(normalized.split(/\s+/)[1] ?? "", 10);
         if (Number.isFinite(offset) && offset >= 0 && offset <= 24) {
-          await this.deps.faucetStore.setUserPreferences(wallet, { reminder_offset: offset });
+          if (this.deps.faucetCore) {
+            await this.deps.faucetCore.setReminderPreferences(wallet, { reminder_offset: offset });
+          } else {
+            await this.deps.faucetStore.setUserPreferences(wallet, { reminder_offset: offset });
+          }
           await this.deps.sendMessage(replyRoomId, `Reminder offset set to ${offset} hour(s).`);
           return;
         }
@@ -298,9 +315,34 @@ export class CommandRouter {
     });
 
     this.register("faucet", async ({ sender, replyRoomId }) => {
-      const wallet = extractWalletFromUserId(sender);
+      const wallet = await this.resolveWallet(sender);
       if (!wallet) {
         await this.deps.sendMessage(replyRoomId, "Could not extract your XRPL wallet from your Matrix ID.");
+        return;
+      }
+      if (this.deps.faucetCore) {
+        const result = await this.deps.faucetCore.redeemClaim({
+          wallet,
+          matrixRoomId: replyRoomId,
+          reminderChannels: ["matrix_dm", "in_app"],
+        });
+        if (!result.success || !result.txHash) {
+          await this.deps.sendMessage(replyRoomId, `Faucet payment failed: ${result.reason ?? "Unknown error"}`);
+          return;
+        }
+        await this.deps.sendMessage(
+          replyRoomId,
+          [
+            "Faucet claim successful.",
+            `Payout: ${result.payoutAmount} ${this.deps.faucetCurrencyCode}`,
+            `Base: ${result.baseAmount}`,
+            `LP multiplier: ${result.multiplier}x`,
+            `Transaction: ${shortHash(result.txHash)}`,
+            result.explorerUrl ? `Explorer: ${result.explorerUrl}` : "",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        );
         return;
       }
       if (!this.deps.faucetWalletSeed || !this.deps.tokenIssuer) {
@@ -397,6 +439,14 @@ export class CommandRouter {
           .join("\n"),
       );
     });
+  }
+
+  private async resolveWallet(sender: string): Promise<string | null> {
+    if (this.deps.resolveWalletForSender) {
+      const linked = await this.deps.resolveWalletForSender(sender);
+      if (linked) return linked;
+    }
+    return extractWalletFromUserId(sender);
   }
 }
 

@@ -27,6 +27,14 @@ export interface BotConfig {
   logLevel: string;
   invalidateTokenOnShutdown: boolean;
   lpInfo: string;
+  xappEnabled: boolean;
+  xappHost: string;
+  xappPort: number;
+  xappSessionSecret: string;
+  xappSessionTtlSeconds: number;
+  xappJwtIssuer: string;
+  xappJwtAudience: string;
+  xappStorageDir: string;
 }
 
 const REQUIRED_ENV = [
@@ -114,6 +122,14 @@ export function loadConfig(env = process.env): BotConfig {
     logLevel: env.BOT_LOG_LEVEL ?? "info",
     invalidateTokenOnShutdown: asBool(env.INVALIDATE_TOKEN_ON_SHUTDOWN, false),
     lpInfo: env.LP_INFO ?? "",
+    xappEnabled: asBool(env.XAPP_ENABLED, false),
+    xappHost: env.XAPP_HOST ?? "0.0.0.0",
+    xappPort: asInt(env.XAPP_PORT, 9010),
+    xappSessionSecret: env.XAPP_SESSION_SECRET ?? env.MATRIX_AS_TOKEN ?? "dev-xapp-secret",
+    xappSessionTtlSeconds: asInt(env.XAPP_SESSION_TTL_SECONDS, 3600),
+    xappJwtIssuer: env.XAPP_JWT_ISSUER ?? "textrp-xapp",
+    xappJwtAudience: env.XAPP_JWT_AUDIENCE ?? "textrp-xapp-clients",
+    xappStorageDir: path.join(hpStateDir, "xapp"),
   };
 }
 

@@ -12,6 +12,10 @@ import { CommandRouter } from "./commandRouter.js";
 import { ContractStoreClient } from "../services/contractStoreClient.js";
 import type { FaucetStateStore } from "../services/faucetStateStore.js";
 import { XRPL_UNIX_EPOCH_OFFSET, XrplService } from "../services/xrplClient.js";
+import { InAppNotificationStore } from "../storage/inAppNotificationStore.js";
+import { IdentityLinkStore } from "../storage/identityLinkStore.js";
+import { NotificationService } from "../notifications/notificationService.js";
+import { FaucetCoreService } from "../domain/faucetCoreService.js";
 
 interface RoomMemberRecord {
   roomId: string;
@@ -25,6 +29,9 @@ export class AppserviceBot {
   private readonly contractStoreClient: ContractStoreClient;
   private readonly appservice: Appservice;
   private readonly commandRouter: CommandRouter;
+  private readonly identityLinkStore: IdentityLinkStore;
+  private readonly notificationService: NotificationService;
+  private readonly faucetCore: FaucetCoreService;
   private readonly knownMembership = new Map<string, Set<string>>();
   private reminderTimer?: NodeJS.Timeout;
   private stopping = false;
@@ -43,6 +50,23 @@ export class AppserviceBot {
       cooldownHours: config.faucetCooldownHours,
     });
     this.faucetStore = this.contractStoreClient;
+    const inAppStore = new InAppNotificationStore(config.xappStorageDir);
+    this.identityLinkStore = new IdentityLinkStore(config.xappStorageDir);
+    this.notificationService = new NotificationService(this.faucetStore, inAppStore);
+    this.faucetCore = new FaucetCoreService(
+      {
+        faucetCurrencyCode: config.faucetCurrencyCode,
+        faucetCooldownHours: config.faucetCooldownHours,
+        faucetDailyAmount: config.faucetDailyAmount,
+        faucetMinXrpBalance: config.faucetMinXrpBalance,
+        tokenIssuer: config.tokenIssuer,
+        faucetWalletSeed: config.faucetWalletSeed,
+        commandPrefix: config.commandPrefix,
+      },
+      this.faucetStore,
+      this.xrpl,
+      this.notificationService,
+    );
 
     const usernameParts = config.textrpUsername.split(":");
     const homeserverName = usernameParts.length > 1 ? usernameParts[1] : "";
@@ -84,6 +108,8 @@ export class AppserviceBot {
       faucetStore: this.faucetStore,
       xrpl: this.xrpl,
       getDeterministicEpoch: async () => this.getDeterministicEpoch(),
+      faucetCore: this.faucetCore,
+      resolveWalletForSender: async (sender) => this.identityLinkStore.getByMatrixUserId(sender)?.wallet_address ?? null,
       sendMessage: async (roomId, body) => {
         const client = this.appservice.botIntent.underlyingClient;
         await client.sendMessage(roomId, { msgtype: "m.text", body });
@@ -209,6 +235,18 @@ export class AppserviceBot {
     } catch {
       return null;
     }
+  }
+
+  getFaucetCoreService(): FaucetCoreService {
+    return this.faucetCore;
+  }
+
+  getNotificationService(): NotificationService {
+    return this.notificationService;
+  }
+
+  getIdentityLinkStore(): IdentityLinkStore {
+    return this.identityLinkStore;
   }
 }
 

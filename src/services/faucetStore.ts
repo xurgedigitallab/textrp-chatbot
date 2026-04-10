@@ -294,6 +294,10 @@ export class FaucetStore {
     ];
   }
 
+  async getClaimSnapshot(wallet: string): Promise<ClaimRecord | null> {
+    return this.claims[wallet] ? { ...this.claims[wallet] } : null;
+  }
+
   async recordRoomJoin(roomId: string, roomName?: string): Promise<boolean> {
     try {
       const now = await this.currentEpoch();
