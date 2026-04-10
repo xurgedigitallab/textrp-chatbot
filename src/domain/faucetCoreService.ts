@@ -1,6 +1,6 @@
 import * as xrpl from "xrpl";
 
-import type { FaucetStore } from "../services/faucetStore.js";
+import type { FaucetStateStore } from "../services/faucetStateStore.js";
 import { FAUCET_BALANCE_FACTOR, type XrplService } from "../services/xrplClient.js";
 import type { NotificationService, ReminderChannel } from "../notifications/notificationService.js";
 
@@ -44,7 +44,7 @@ export interface RedeemClaimResult {
 export class FaucetCoreService {
   constructor(
     private readonly config: FaucetCoreConfig,
-    private readonly faucetStore: FaucetStore,
+    private readonly faucetStore: FaucetStateStore,
     private readonly xrplService: XrplService,
     private readonly notificationService?: NotificationService,
   ) {}
@@ -77,7 +77,10 @@ export class FaucetCoreService {
     }
 
     const eligibility = await this.faucetStore.checkClaimEligibility(wallet);
-    const snapshot = await this.faucetStore.getClaimSnapshot(wallet);
+    const snapshotReader = this.faucetStore as FaucetStateStore & {
+      getClaimSnapshot?: (wallet: string) => Promise<{ last_claim_epoch: number } | null>;
+    };
+    const snapshot = snapshotReader.getClaimSnapshot ? await snapshotReader.getClaimSnapshot(wallet) : null;
     const nextClaimEpoch =
       snapshot == null
         ? undefined

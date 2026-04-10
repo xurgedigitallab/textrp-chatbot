@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import path from "node:path";
 
 export interface BotConfig {
   textrpHomeserver: string;
@@ -129,7 +130,7 @@ export function loadConfig(env = process.env): BotConfig {
     xappSessionTtlSeconds: asInt(env.XAPP_SESSION_TTL_SECONDS, 3600),
     xappJwtIssuer: env.XAPP_JWT_ISSUER ?? "textrp-xapp",
     xappJwtAudience: env.XAPP_JWT_AUDIENCE ?? "textrp-xapp-clients",
-    xappStorageDir: path.join(hpStateDir, "xapp"),
+    xappStorageDir: path.resolve(env.XAPP_STORAGE_DIR ?? "./.data/xapp"),
   };
 }
 

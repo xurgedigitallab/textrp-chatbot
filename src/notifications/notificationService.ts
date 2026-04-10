@@ -1,11 +1,11 @@
-import type { FaucetStore } from "../services/faucetStore.js";
+import type { FaucetStateStore } from "../services/faucetStateStore.js";
 import { InAppNotificationStore } from "../storage/inAppNotificationStore.js";
 
 export type ReminderChannel = "matrix_dm" | "in_app";
 
 export class NotificationService {
   constructor(
-    private readonly faucetStore: FaucetStore,
+    private readonly faucetStore: FaucetStateStore,
     private readonly inAppStore: InAppNotificationStore,
   ) {}
 
