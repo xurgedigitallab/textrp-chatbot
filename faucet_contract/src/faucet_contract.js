@@ -99,7 +99,7 @@ class faucet_contract {
 
     epochFromContext(contextEpoch) {
         const n = Number(contextEpoch);
-        if (!Number.isFinite(n)) return 0;
+        if (!Number.isFinite(n) || n <= 0) return Math.trunc(Date.now() / 1000);
         if (n > 1_000_000_000_000) return Math.trunc(n / 1000);
         return Math.trunc(n);
     }
@@ -208,8 +208,8 @@ class faucet_contract {
         const elapsed = nowEpoch - Number(claim.last_claim_epoch ?? 0);
         const cooldownSeconds = this.cooldownHours * 3600;
         if (elapsed < cooldownSeconds) {
-            const hoursRemaining = (cooldownSeconds - elapsed) / 3600;
-            return { eligible: false, reason: `Please wait ${hoursRemaining.toFixed(1)} hours before claiming again` };
+            const secondsRemaining = Math.max(0, Math.trunc(cooldownSeconds - elapsed));
+            return { eligible: false, seconds_remaining: secondsRemaining };
         }
         return { eligible: true };
     }

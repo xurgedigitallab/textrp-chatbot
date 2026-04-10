@@ -17,6 +17,7 @@ export interface FaucetCoreConfig {
 export interface ClaimStatus {
   eligible: boolean;
   reason?: string;
+  secondsRemaining?: number;
   xrpBalance?: number | null;
   trustLinePresent: boolean;
   nextClaimEpoch?: number;
@@ -88,7 +89,10 @@ export class FaucetCoreService {
 
     return {
       eligible: eligibility.eligible,
-      reason: eligibility.reason,
+      reason: eligibility.eligible
+        ? undefined
+        : formatCooldownReason(eligibility.secondsRemaining, eligibility.reason, this.config.faucetCooldownHours),
+      secondsRemaining: eligibility.eligible ? undefined : eligibility.secondsRemaining,
       xrpBalance,
       trustLinePresent: true,
       nextClaimEpoch,
@@ -205,4 +209,53 @@ function xrplWalletFromSeed(seed: string): string {
   } catch {
     return "";
   }
+}
+
+function formatCooldownReason(
+  secondsRemaining: number | undefined,
+  reason: string | undefined,
+  maxCooldownHours = 24,
+): string | undefined {
+  if (typeof secondsRemaining === "number" && Number.isFinite(secondsRemaining)) {
+    const maxSeconds = Math.max(1, maxCooldownHours) * 3600;
+    return `Please wait ${formatDuration(Math.min(Math.max(0, Math.ceil(secondsRemaining)), maxSeconds))} before claiming again`;
+  }
+  return toHumanCooldownReason(reason, maxCooldownHours);
+}
+
+function toHumanCooldownReason(reason: string | undefined, maxCooldownHours = 24): string | undefined {
+  if (!reason) return reason;
+  const waitPattern = /please wait\s+([\d.]+)\s+(seconds?|minutes?|hours?|days?)\b/i;
+  const match = reason.match(waitPattern);
+  if (!match) return reason;
+
+  const amount = Number.parseFloat(match[1] ?? "");
+  const unit = (match[2] ?? "").toLowerCase();
+  if (!Number.isFinite(amount) || amount <= 0) return reason;
+
+  let totalSeconds = 0;
+  if (unit.startsWith("second")) totalSeconds = amount;
+  else if (unit.startsWith("minute")) totalSeconds = amount * 60;
+  else if (unit.startsWith("hour")) {
+    // Guard for backends that accidentally label seconds as "hours".
+    totalSeconds = amount > 1_000 ? amount : amount * 3600;
+  } else if (unit.startsWith("day")) totalSeconds = amount * 86_400;
+
+  if (totalSeconds <= 0) return reason;
+  const maxSeconds = Math.max(1, maxCooldownHours) * 3600;
+  return `Please wait ${formatDuration(Math.min(Math.ceil(totalSeconds), maxSeconds))} before claiming again`;
+}
+
+function formatDuration(totalSeconds: number): string {
+  const days = Math.floor(totalSeconds / 86_400);
+  const hours = Math.floor((totalSeconds % 86_400) / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const parts: string[] = [];
+
+  if (days > 0) parts.push(`${days} day${days === 1 ? "" : "s"}`);
+  if (hours > 0) parts.push(`${hours} hour${hours === 1 ? "" : "s"}`);
+  if (minutes > 0 && days === 0) parts.push(`${minutes} minute${minutes === 1 ? "" : "s"}`);
+  if (parts.length === 0) parts.push("under a minute");
+
+  return parts.slice(0, 2).join(" ");
 }

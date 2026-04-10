@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import type { ClaimEligibilityResult } from "./faucetStateStore.js";
 
 const JSON_VERSION = 1;
 
@@ -228,7 +229,7 @@ export class FaucetStore {
     return parsed;
   }
 
-  async checkClaimEligibility(wallet: string): Promise<{ eligible: boolean; reason?: string }> {
+  async checkClaimEligibility(wallet: string): Promise<ClaimEligibilityResult> {
     if (this.blacklist[wallet]) return { eligible: false, reason: "Wallet is blacklisted from faucet" };
 
     try {
@@ -238,8 +239,8 @@ export class FaucetStore {
         const elapsed = nowEpoch - Number(claim.last_claim_epoch);
         const cooldown = this.cooldownHours * 3600;
         if (elapsed < cooldown) {
-          const hoursRemaining = (cooldown - elapsed) / 3600;
-          return { eligible: false, reason: `Please wait ${hoursRemaining.toFixed(1)} hours before claiming again` };
+          const secondsRemaining = Math.max(0, Math.trunc(cooldown - elapsed));
+          return { eligible: false, secondsRemaining };
         }
       }
       return { eligible: true };

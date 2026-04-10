@@ -109,6 +109,41 @@ Reference documentation: [matrix-bot-sdk Appservice tutorial](https://turt2live.
 - `!history`
 - `!reminders [status|on|off|set <hours>]`
 
+## HotPocket RPC Notes
+
+`claim.eligibility` now returns a machine-readable cooldown value. Contract responses use snake_case fields.
+
+Example response while wallet is in cooldown:
+
+```json
+{
+  "v": 1,
+  "id": "req-123",
+  "ok": true,
+  "cmd": "claim.eligibility",
+  "data": {
+    "eligible": false,
+    "seconds_remaining": 86340
+  }
+}
+```
+
+Example response when wallet is eligible:
+
+```json
+{
+  "v": 1,
+  "id": "req-124",
+  "ok": true,
+  "cmd": "claim.eligibility",
+  "data": {
+    "eligible": true
+  }
+}
+```
+
+Client-side adapters convert `seconds_remaining` to `secondsRemaining` and format user-facing text in bot/xApp layers.
+
 ## Faucet State Files
 
 Under the resolved faucet storage directory:

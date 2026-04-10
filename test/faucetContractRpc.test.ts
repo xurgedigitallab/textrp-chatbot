@@ -11,7 +11,7 @@ const { faucet_contract: FaucetContract } = require("../faucet_contract/src/fauc
     handleRequest: (
       user: { send: (output: unknown) => Promise<void> },
       message: Record<string, unknown>,
-      context: { isReadOnly: boolean; epoch: number },
+      context: { isReadOnly: boolean; epoch?: number },
     ) => Promise<void>;
   };
 };
@@ -82,5 +82,41 @@ describe("faucet contract rpc", () => {
     const history = (historyResponse?.data as { history?: Array<Record<string, unknown>> } | undefined)?.history ?? [];
     expect(history).toHaveLength(1);
     expect(history[0].first_claim).toBe(new Date(recordEpoch * 1000).toISOString().replace("Z", ""));
+  });
+
+  it("uses unix epoch fallback when readonly context epoch is missing", async () => {
+    const dbFile = path.join(os.tmpdir(), `hp-contract-${Date.now()}-3.db`);
+    cleanupPaths.push(dbFile);
+
+    const app = new FaucetContract({ dbFile, cooldownHours: 24 });
+    const outputs: Array<Record<string, unknown>> = [];
+    const user = {
+      send: async (output: unknown) => {
+        outputs.push(output as Record<string, unknown>);
+      },
+    };
+    app.sendOutput = async (u, output) => {
+      await (u as typeof user).send(output);
+    };
+
+    const nowEpoch = Math.trunc(Date.now() / 1000);
+    await app.handleRequest(
+      user,
+      { v: 1, id: "req-4", cmd: "claim.record", wallet: "rWallet", amount: "10", tx_hash: "TX3" },
+      { isReadOnly: false, epoch: nowEpoch },
+    );
+
+    await app.handleRequest(
+      user,
+      { v: 1, id: "req-5", cmd: "claim.eligibility", wallet: "rWallet" },
+      { isReadOnly: true },
+    );
+
+    const eligibilityResponse = outputs.find((output) => output.id === "req-5");
+    const data = (eligibilityResponse?.data as { eligible?: boolean; reason?: string; seconds_remaining?: number } | undefined) ?? {};
+    expect(data.eligible).toBe(false);
+    expect(typeof data.seconds_remaining).toBe("number");
+    expect((data.seconds_remaining ?? 0) > 0).toBe(true);
+    expect(data.reason).toBeUndefined();
   });
 });

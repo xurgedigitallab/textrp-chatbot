@@ -369,7 +369,11 @@ export class CommandRouter {
 
       const eligibility = await this.deps.faucetStore.checkClaimEligibility(wallet);
       if (!eligibility.eligible) {
-        await this.deps.sendMessage(replyRoomId, `Cannot claim right now: ${eligibility.reason}`);
+        const waitReason =
+          typeof eligibility.secondsRemaining === "number"
+            ? `Please wait ${formatDuration(eligibility.secondsRemaining)} before claiming again`
+            : eligibility.reason ?? "Not eligible";
+        await this.deps.sendMessage(replyRoomId, `Cannot claim right now: ${waitReason}`);
         return;
       }
 
@@ -463,5 +467,18 @@ function xrplWalletFromSeed(seed: string): string {
   } catch {
     return "";
   }
+}
+
+function formatDuration(totalSeconds: number): string {
+  const boundedSeconds = Math.max(0, Math.ceil(totalSeconds));
+  const days = Math.floor(boundedSeconds / 86_400);
+  const hours = Math.floor((boundedSeconds % 86_400) / 3_600);
+  const minutes = Math.floor((boundedSeconds % 3_600) / 60);
+  const parts: string[] = [];
+  if (days > 0) parts.push(`${days} day${days === 1 ? "" : "s"}`);
+  if (hours > 0) parts.push(`${hours} hour${hours === 1 ? "" : "s"}`);
+  if (minutes > 0 && days === 0) parts.push(`${minutes} minute${minutes === 1 ? "" : "s"}`);
+  if (parts.length === 0) parts.push("under a minute");
+  return parts.slice(0, 2).join(" ");
 }
 

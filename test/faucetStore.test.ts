@@ -37,7 +37,7 @@ describe("faucet store", () => {
 
     const secondCheck = await store.checkClaimEligibility("rWalletA");
     expect(secondCheck.eligible).toBe(false);
-    expect(secondCheck.reason).toContain("Please wait");
+    expect(secondCheck.secondsRemaining).toBeGreaterThan(0);
 
     epoch += 24 * 3600 + 60;
     const thirdCheck = await store.checkClaimEligibility("rWalletA");

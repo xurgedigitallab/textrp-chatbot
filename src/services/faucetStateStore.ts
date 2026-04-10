@@ -4,8 +4,14 @@ export interface UserPreferencesPatch {
   timezone?: string;
 }
 
+export interface ClaimEligibilityResult {
+  eligible: boolean;
+  reason?: string;
+  secondsRemaining?: number;
+}
+
 export interface FaucetStateStore {
-  checkClaimEligibility(wallet: string): Promise<{ eligible: boolean; reason?: string }>;
+  checkClaimEligibility(wallet: string): Promise<ClaimEligibilityResult>;
   recordClaim(wallet: string, amount: string, txHash: string, eventEpoch?: number): Promise<boolean>;
   getUserClaimHistory(wallet: string): Promise<Array<Record<string, unknown>>>;
   recordRoomJoin(roomId: string, roomName?: string): Promise<boolean>;

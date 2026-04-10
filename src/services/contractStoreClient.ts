@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as HotPocket from "hotpocket-js-client";
 
-import type { FaucetStateStore, UserPreferencesPatch } from "./faucetStateStore.js";
+import type { ClaimEligibilityResult, FaucetStateStore, UserPreferencesPatch } from "./faucetStateStore.js";
 
 type RpcRequest = {
   v: 1;
@@ -158,11 +158,17 @@ export class ContractStoreClient implements FaucetStateStore {
     return output.data ?? {};
   }
 
-  async checkClaimEligibility(wallet: string): Promise<{ eligible: boolean; reason?: string }> {
+  async checkClaimEligibility(wallet: string): Promise<ClaimEligibilityResult> {
     const data = await this.rpcRead("claim.eligibility", { wallet });
+    const secondsRemainingRaw = data.seconds_remaining;
+    const secondsRemaining =
+      typeof secondsRemainingRaw === "number" && Number.isFinite(secondsRemainingRaw)
+        ? Math.max(0, Math.trunc(secondsRemainingRaw))
+        : undefined;
     return {
       eligible: Boolean(data.eligible),
       reason: typeof data.reason === "string" ? data.reason : undefined,
+      secondsRemaining,
     };
   }
 
