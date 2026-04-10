@@ -2,6 +2,7 @@ import * as xrpl from "xrpl";
 
 export const XRPL_UNIX_EPOCH_OFFSET = 946684800;
 export const FAUCET_BALANCE_FACTOR = 0.000001;
+const SECP256K1_ALGORITHM = ((xrpl as any).ECDSA?.secp256k1 ?? "ecdsa-secp256k1") as any;
 
 type TrustLine = {
   currency: string;
@@ -168,7 +169,7 @@ export class XrplService {
   }): Promise<{ success: boolean; txHash?: string; explorerUrl?: string; error?: string }> {
     await this.connect();
     try {
-      const wallet = xrpl.Wallet.fromSeed(params.walletSeed);
+      const wallet = xrpl.Wallet.fromSeed(params.walletSeed, { algorithm: SECP256K1_ALGORITHM });
       const payment: xrpl.Payment = {
         TransactionType: "Payment",
         Account: wallet.classicAddress,

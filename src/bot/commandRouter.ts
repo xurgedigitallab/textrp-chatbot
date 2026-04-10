@@ -4,6 +4,8 @@ import { shortHash, extractWalletFromUserId } from "../utils/wallet.js";
 import { FaucetCoreService } from "../domain/faucetCoreService.js";
 import * as xrpl from "xrpl";
 
+const SECP256K1_ALGORITHM = ((xrpl as any).ECDSA?.secp256k1 ?? "ecdsa-secp256k1") as any;
+
 type CommandHandler = (context: CommandContext) => Promise<void>;
 
 interface MatrixMessageEvent {
@@ -404,7 +406,11 @@ export class CommandRouter {
       });
 
       if (!txResult.success || !txResult.txHash) {
-        await this.deps.sendMessage(replyRoomId, `Faucet payment failed: ${txResult.error ?? "Unknown error"}`);
+        console.error("Faucet payment failed", {
+          destination: wallet,
+          error: txResult.error ?? "Unknown error",
+        });
+        await this.deps.sendMessage(replyRoomId, "Faucet payment failed. Please try again later.");
         return;
       }
 
@@ -452,7 +458,7 @@ export class CommandRouter {
 
 function xrplWalletFromSeed(seed: string): string {
   try {
-    const wallet = xrpl.Wallet.fromSeed(seed);
+    const wallet = xrpl.Wallet.fromSeed(seed, { algorithm: SECP256K1_ALGORITHM });
     return wallet.classicAddress;
   } catch {
     return "";

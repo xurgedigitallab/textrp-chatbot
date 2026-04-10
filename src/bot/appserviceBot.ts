@@ -17,6 +17,8 @@ import { IdentityLinkStore } from "../storage/identityLinkStore.js";
 import { NotificationService } from "../notifications/notificationService.js";
 import { FaucetCoreService } from "../domain/faucetCoreService.js";
 
+const SECP256K1_ALGORITHM = ((xrpl as any).ECDSA?.secp256k1 ?? "ecdsa-secp256k1") as any;
+
 interface RoomMemberRecord {
   roomId: string;
   userId: string;
@@ -231,7 +233,7 @@ export class AppserviceBot {
   faucetWalletAddress(): string | null {
     if (!this.config.faucetWalletSeed) return null;
     try {
-      return xrpl.Wallet.fromSeed(this.config.faucetWalletSeed).classicAddress;
+      return xrpl.Wallet.fromSeed(this.config.faucetWalletSeed, { algorithm: SECP256K1_ALGORITHM }).classicAddress;
     } catch {
       return null;
     }
